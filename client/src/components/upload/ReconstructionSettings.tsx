@@ -3,7 +3,7 @@ import { Play, ChevronDown, ChevronRight, Zap } from "lucide-react";
 import type { TrainingConfig } from "../../types/api.ts";
 import { getPresets, PARAM_DEFS, PARAM_DEFS_2DGS } from "../../constants/presets.ts";
 
-type Mode = "anysplat" | "2dgs" | "3dgs";
+type Mode = "anysplat" | "spfsplat" | "2dgs" | "3dgs";
 
 interface Props {
   onStart: (config: TrainingConfig) => void;
@@ -41,6 +41,7 @@ export function ReconstructionSettings({ onStart, onAnySplat }: Props) {
   };
 
   const isAnySplat = mode === "anysplat";
+  const isFeedForward = mode === "anysplat" || mode === "spfsplat";
   const allSliders = mode === "2dgs"
     ? [...PARAM_DEFS, ...PARAM_DEFS_2DGS]
     : PARAM_DEFS;
@@ -63,6 +64,16 @@ export function ReconstructionSettings({ onStart, onAnySplat }: Props) {
           }`}
         >
           Instant (AnySplat)
+        </button>
+        <button
+          onClick={() => switchMode("spfsplat")}
+          className={`flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+            mode === "spfsplat"
+              ? "bg-emerald-600 text-white"
+              : "text-gray-400 hover:text-white"
+          }`}
+        >
+          SPFSplat
         </button>
         <button
           onClick={() => switchMode("2dgs")}
@@ -97,6 +108,17 @@ export function ReconstructionSettings({ onStart, onAnySplat }: Props) {
         </div>
       )}
 
+      {/* SPFSplat description */}
+      {mode === "spfsplat" && (
+        <div className="mb-4 text-xs text-gray-400 bg-gray-900 rounded-lg px-4 py-3 border border-gray-800">
+          <div className="flex items-center gap-1.5 mb-1 text-emerald-400 font-medium">
+            <Zap className="w-3.5 h-3.5" />
+            Pose-free feed-forward (SPFSplat V2)
+          </div>
+          256px resolution, DC-only SH, max 8 views. No refinement support (no camera export). Good for comparison.
+        </div>
+      )}
+
       {/* Preset cards */}
       <div className="grid grid-cols-3 gap-3 mb-6">
         {presets.map((preset, i) => (
@@ -116,8 +138,8 @@ export function ReconstructionSettings({ onStart, onAnySplat }: Props) {
         ))}
       </div>
 
-      {/* Training-specific options (hidden for AnySplat) */}
-      {!isAnySplat && (
+      {/* Training-specific options (hidden for feed-forward modes) */}
+      {!isFeedForward && (
         <>
           {/* SfM backend toggle */}
           <div className="mb-4">
@@ -222,15 +244,23 @@ export function ReconstructionSettings({ onStart, onAnySplat }: Props) {
 
       {/* Start button */}
       <button
-        onClick={() => isAnySplat && onAnySplat ? onAnySplat() : onStart(config)}
+        onClick={() => {
+          if (isAnySplat && onAnySplat) {
+            onAnySplat();
+          } else if (mode === "spfsplat") {
+            onStart({ ...config, sfm_backend: "spfsplat" as any });
+          } else {
+            onStart(config);
+          }
+        }}
         className={`flex items-center gap-2 px-6 py-3 rounded-lg text-sm font-medium transition-colors mx-auto ${
-          isAnySplat
+          isFeedForward
             ? "bg-emerald-600 hover:bg-emerald-500"
             : "bg-blue-600 hover:bg-blue-500"
         }`}
       >
-        {isAnySplat ? <Zap className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-        {isAnySplat ? "Open AnySplat Studio" : "Start Reconstruction"}
+        {isFeedForward ? <Zap className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+        {isAnySplat ? "Open AnySplat Studio" : mode === "spfsplat" ? "Run SPFSplat" : "Start Reconstruction"}
       </button>
     </div>
   );

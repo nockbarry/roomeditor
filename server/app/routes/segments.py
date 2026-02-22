@@ -20,10 +20,13 @@ from app.schemas import (
     BatchTransformRequest,
     ClickSegmentRequest,
     DuplicateRequest,
+    LightingRequest,
+    MergeSegmentsRequest,
     RenameRequest,
     SegmentInfo,
     SegmentManifest,
     SegmentTransformRequest,
+    SplitSegmentRequest,
     VisibilityRequest,
 )
 
@@ -142,6 +145,110 @@ def _run_auto_segment(frames_dir: Path, project_dir: Path) -> dict:
     """Run auto segmentation (called in thread pool)."""
     from pipeline.segment_objects import auto_segment_project
     return auto_segment_project(frames_dir, project_dir)
+
+
+@router.post("/{project_id}/auto-segment-full", response_model=SegmentManifest)
+async def auto_segment_full(
+    project_id: str,
+    max_frames: int = 5,
+    db: AsyncSession = Depends(get_db),
+):
+    """Run full auto segmentation pipeline: detect + multi-view assign in one shot."""
+    await _require_project(project_id, db)
+
+    project_dir = _get_project_dir(project_id)
+    frames_dir = project_dir / "frames"
+    ply_path = project_dir / "scene.ply"
+    cameras_path = project_dir / "cameras.json"
+    seg_path = project_dir / "segment_index_map.bin"
+
+    if not frames_dir.exists() or not list(frames_dir.glob("frame_*.jpg")):
+        raise HTTPException(status_code=400, detail="No frames found. Extract frames first.")
+    if not ply_path.exists():
+        raise HTTPException(status_code=400, detail="No scene.ply found")
+
+    import asyncio
+    from app.routes.ws import broadcast_stream_update
+
+    loop = asyncio.get_event_loop()
+
+    async def _progress(frac, message):
+        await broadcast_stream_update(project_id, {
+            "type": "segment_progress",
+            "progress": round(frac, 3),
+            "message": message,
+        })
+
+    try:
+        segments = await loop.run_in_executor(
+            _segment_executor,
+            lambda: _run_auto_segment_full(
+                ply_path, frames_dir, seg_path, cameras_path, max_frames, loop, _progress
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Auto-segment-full failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Read the manifest that was written by segment_scene
+    manifest_path = project_dir / "segment_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        return _manifest_to_response(manifest)
+
+    return {"segments": [], "total": 0, "primary_frame": None, "total_gaussians": 0, "unassigned_gaussians": 0}
+
+
+def _run_auto_segment_full(ply_path, frames_dir, seg_path, cameras_path, max_frames, loop, progress_cb):
+    """Run full segmentation pipeline in thread pool."""
+    import asyncio
+    from pipeline.segment_scene import segment_scene
+
+    async def _async_progress(frac, msg):
+        await progress_cb(frac, msg)
+
+    def _sync_wrapper():
+        return asyncio.run_coroutine_threadsafe(
+            segment_scene(ply_path, frames_dir, seg_path, cameras_path, max_frames, _async_progress),
+            loop,
+        ).result()
+
+    return _sync_wrapper()
+
+
+@router.post("/{project_id}/delete-gaussians")
+async def delete_gaussians_by_ids(
+    project_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete specific gaussians by their indices (set opacity to -100)."""
+    await _require_project(project_id, db)
+
+    gaussian_ids = body.get("gaussian_ids", [])
+    if not gaussian_ids:
+        raise HTTPException(status_code=400, detail="No gaussian_ids provided")
+
+    project_dir = _get_project_dir(project_id)
+    ply_path = project_dir / "scene.ply"
+
+    if not ply_path.exists():
+        raise HTTPException(status_code=400, detail="No scene.ply found")
+
+    _save_checkpoint(project_dir, f"delete {len(gaussian_ids)} gaussians")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    try:
+        await loop.run_in_executor(
+            _segment_executor,
+            lambda: _delete_gaussians(ply_path, gaussian_ids),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"status": "ok", "removed_gaussians": len(gaussian_ids)}
 
 
 @router.post("/{project_id}/click-segment", response_model=SegmentInfo)
@@ -798,6 +905,45 @@ async def create_background_segment(
 
 
 # ---------------------------------------------------------------------------
+# Classify Segments (CLIP)
+# ---------------------------------------------------------------------------
+
+@router.post("/{project_id}/classify-segments", response_model=SegmentManifest)
+async def classify_segments(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Classify segments using CLIP zero-shot classification."""
+    await _require_project(project_id, db)
+
+    project_dir = _get_project_dir(project_id)
+    manifest_path = project_dir / "segment_manifest.json"
+    frames_dir = project_dir / "frames"
+
+    if not manifest_path.exists():
+        raise HTTPException(status_code=400, detail="No segments found")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    try:
+        manifest = await loop.run_in_executor(
+            _segment_executor,
+            lambda: _classify_segments(manifest_path, frames_dir),
+        )
+    except Exception as e:
+        logger.error(f"Classification failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return _manifest_to_response(manifest)
+
+
+def _classify_segments(manifest_path: Path, frames_dir: Path) -> dict:
+    from pipeline.classify_segments import classify_segments
+    return classify_segments(manifest_path, frames_dir)
+
+
+# ---------------------------------------------------------------------------
 # Batch Transform
 # ---------------------------------------------------------------------------
 
@@ -844,6 +990,421 @@ async def batch_transform(
 
 
 # ---------------------------------------------------------------------------
+# Merge Segments
+# ---------------------------------------------------------------------------
+
+@router.post("/{project_id}/segments/merge", response_model=SegmentManifest)
+async def merge_segments(
+    project_id: str,
+    body: MergeSegmentsRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Merge multiple segments into one."""
+    await _require_project(project_id, db)
+
+    project_dir = _get_project_dir(project_id)
+    manifest = _read_manifest(project_dir)
+
+    if len(body.segment_ids) < 2:
+        raise HTTPException(status_code=400, detail="Need at least 2 segments to merge")
+
+    _save_checkpoint(project_dir, f"merge {len(body.segment_ids)} segments")
+
+    # Gather all gaussian_ids from the segments to merge
+    merged_ids = []
+    merged_area = 0
+    segments_to_remove = []
+    for seg_id in body.segment_ids:
+        seg = next((s for s in manifest["segments"] if s["id"] == seg_id), None)
+        if seg:
+            merged_ids.extend(seg.get("gaussian_ids", []))
+            merged_area += seg.get("area", 0)
+            segments_to_remove.append(seg_id)
+
+    if not merged_ids:
+        raise HTTPException(status_code=400, detail="No gaussians to merge")
+
+    # Remove old segments
+    manifest["segments"] = [s for s in manifest["segments"] if s["id"] not in segments_to_remove]
+
+    # Create merged segment
+    existing_ids = [s["id"] for s in manifest["segments"]]
+    new_id = max(existing_ids) + 1 if existing_ids else 1
+
+    new_seg = {
+        "id": new_id,
+        "label": body.label or "merged",
+        "area": merged_area,
+        "bbox": [0, 0, 0, 0],
+        "confidence": 1.0,
+        "primary_frame": manifest.get("primary_frame", ""),
+        "color": _random_color(),
+        "gaussian_ids": merged_ids,
+        "n_gaussians": len(merged_ids),
+        "visible": True,
+    }
+    manifest["segments"].append(new_seg)
+    manifest["total"] = len(manifest["segments"])
+    _write_manifest(project_dir, manifest)
+
+    # Regenerate segment index map
+    _regenerate_index_map(project_dir, manifest)
+
+    return _manifest_to_response(manifest)
+
+
+# ---------------------------------------------------------------------------
+# Split Segment
+# ---------------------------------------------------------------------------
+
+@router.post("/{project_id}/segments/{segment_id}/split", response_model=SegmentManifest)
+async def split_segment(
+    project_id: str,
+    segment_id: int,
+    body: SplitSegmentRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Split a segment into N clusters using k-means on gaussian positions."""
+    if body is None:
+        body = SplitSegmentRequest()
+
+    await _require_project(project_id, db)
+
+    project_dir = _get_project_dir(project_id)
+    manifest = _read_manifest(project_dir)
+    ply_path = project_dir / "scene.ply"
+    segment = _get_segment(manifest, segment_id)
+
+    if not segment.get("gaussian_ids"):
+        raise HTTPException(status_code=400, detail="Segment has no assigned gaussians")
+
+    _save_checkpoint(project_dir, f"split segment {segment_id} into {body.n_clusters}")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    try:
+        new_segments = await loop.run_in_executor(
+            _segment_executor,
+            lambda: _split_segment(ply_path, manifest, segment, body.n_clusters),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    _write_manifest(project_dir, manifest)
+    _regenerate_index_map(project_dir, manifest)
+
+    return _manifest_to_response(manifest)
+
+
+def _split_segment(ply_path: Path, manifest: dict, segment: dict, n_clusters: int) -> list[dict]:
+    """Split a segment using k-means clustering."""
+    from plyfile import PlyData
+    from scipy.cluster.vq import kmeans2
+
+    plydata = PlyData.read(str(ply_path))
+    vertices = plydata["vertex"]
+
+    ids = np.array(segment["gaussian_ids"])
+    positions = np.column_stack([
+        np.array(vertices["x"])[ids],
+        np.array(vertices["y"])[ids],
+        np.array(vertices["z"])[ids],
+    ]).astype(np.float64)
+
+    _, labels = kmeans2(positions, n_clusters, minit="points")
+
+    # Remove original segment
+    manifest["segments"] = [s for s in manifest["segments"] if s["id"] != segment["id"]]
+
+    existing_ids = [s["id"] for s in manifest["segments"]]
+    next_id = max(existing_ids) + 1 if existing_ids else 1
+
+    new_segments = []
+    for cluster_idx in range(n_clusters):
+        cluster_mask = labels == cluster_idx
+        cluster_gids = ids[cluster_mask].tolist()
+        if not cluster_gids:
+            continue
+
+        new_seg = {
+            "id": next_id,
+            "label": f"{segment.get('label', 'object')}_{cluster_idx}",
+            "area": segment.get("area", 0) // n_clusters,
+            "bbox": segment.get("bbox", [0, 0, 0, 0]),
+            "confidence": segment.get("confidence", 0),
+            "primary_frame": segment.get("primary_frame", ""),
+            "color": _random_color(),
+            "gaussian_ids": cluster_gids,
+            "n_gaussians": len(cluster_gids),
+            "visible": True,
+        }
+        manifest["segments"].append(new_seg)
+        new_segments.append(new_seg)
+        next_id += 1
+
+    manifest["total"] = len(manifest["segments"])
+    return new_segments
+
+
+# ---------------------------------------------------------------------------
+# Per-Segment Mesh Export
+# ---------------------------------------------------------------------------
+
+@router.post("/{project_id}/segments/{segment_id}/extract-mesh")
+async def extract_segment_mesh(
+    project_id: str,
+    segment_id: int,
+    format: str = "glb",
+    db: AsyncSession = Depends(get_db),
+):
+    """Extract mesh for a single segment."""
+    await _require_project(project_id, db)
+
+    project_dir = _get_project_dir(project_id)
+    manifest = _read_manifest(project_dir)
+    ply_path = project_dir / "scene.ply"
+    segment = _get_segment(manifest, segment_id)
+
+    if not segment.get("gaussian_ids"):
+        raise HTTPException(status_code=400, detail="Segment has no assigned gaussians")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    try:
+        mesh_url = await loop.run_in_executor(
+            _segment_executor,
+            lambda: _extract_segment_mesh(ply_path, project_dir, project_id, segment, format),
+        )
+    except Exception as e:
+        logger.error(f"Segment mesh extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"mesh_url": mesh_url}
+
+
+def _extract_segment_mesh(ply_path: Path, project_dir: Path, project_id: str, segment: dict, format: str) -> str:
+    """Create filtered PLY with only segment's gaussians, then extract mesh."""
+    from plyfile import PlyData, PlyElement
+
+    plydata = PlyData.read(str(ply_path))
+    ids = np.array(segment["gaussian_ids"])
+    filtered_data = plydata["vertex"].data[ids].copy()
+    filtered_element = PlyElement.describe(filtered_data, "vertex")
+
+    tmp_ply = project_dir / f"segment_{segment['id']}_filtered.ply"
+    PlyData([filtered_element], text=False).write(str(tmp_ply))
+
+    output_name = f"segment_{segment['id']}_mesh.{format}"
+    output_path = project_dir / output_name
+
+    try:
+        from pipeline.extract_mesh import extract_mesh
+        extract_mesh(str(tmp_ply), str(output_path), format=format)
+    finally:
+        if tmp_ply.exists():
+            tmp_ply.unlink()
+
+    return f"/data/{project_id}/{output_name}"
+
+
+# ---------------------------------------------------------------------------
+# Per-Segment PLY Export
+# ---------------------------------------------------------------------------
+
+@router.post("/{project_id}/segments/{segment_id}/export-ply")
+async def export_segment_ply(
+    project_id: str,
+    segment_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Export a segment's gaussians as a standalone PLY file."""
+    await _require_project(project_id, db)
+
+    project_dir = _get_project_dir(project_id)
+    manifest = _read_manifest(project_dir)
+    ply_path = project_dir / "scene.ply"
+    segment = _get_segment(manifest, segment_id)
+
+    if not segment.get("gaussian_ids"):
+        raise HTTPException(status_code=400, detail="Segment has no assigned gaussians")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    try:
+        ply_url = await loop.run_in_executor(
+            _segment_executor,
+            lambda: _export_segment_ply(ply_path, project_dir, project_id, segment),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"ply_url": ply_url}
+
+
+def _export_segment_ply(ply_path: Path, project_dir: Path, project_id: str, segment: dict) -> str:
+    """Filter PLY to only include segment's gaussians."""
+    from plyfile import PlyData, PlyElement
+
+    plydata = PlyData.read(str(ply_path))
+    ids = np.array(segment["gaussian_ids"])
+    filtered_data = plydata["vertex"].data[ids].copy()
+    filtered_element = PlyElement.describe(filtered_data, "vertex")
+
+    output_name = f"segment_{segment['id']}.ply"
+    output_path = project_dir / output_name
+    PlyData([filtered_element], text=False).write(str(output_path))
+
+    return f"/data/{project_id}/{output_name}"
+
+
+# ---------------------------------------------------------------------------
+# Lighting Adjustment
+# ---------------------------------------------------------------------------
+
+@router.put("/{project_id}/segments/{segment_id}/lighting")
+async def adjust_lighting(
+    project_id: str,
+    segment_id: int,
+    body: LightingRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Adjust SH coefficients (brightness/color) for a segment."""
+    await _require_project(project_id, db)
+
+    project_dir = _get_project_dir(project_id)
+    manifest = _read_manifest(project_dir)
+    ply_path = project_dir / "scene.ply"
+    segment = _get_segment(manifest, segment_id)
+
+    if not segment.get("gaussian_ids"):
+        raise HTTPException(status_code=400, detail="Segment has no assigned gaussians")
+
+    _save_checkpoint(project_dir, f"lighting segment {segment_id}")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    try:
+        await loop.run_in_executor(
+            _segment_executor,
+            lambda: _adjust_lighting(ply_path, segment["gaussian_ids"], body),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"status": "ok"}
+
+
+def _adjust_lighting(ply_path: Path, gaussian_ids: list[int], params: LightingRequest):
+    """Modify SH DC coefficients (f_dc_0/1/2) to adjust brightness/color."""
+    from plyfile import PlyData
+
+    plydata = PlyData.read(str(ply_path))
+    vertices = plydata["vertex"]
+
+    ids = np.array(gaussian_ids)
+
+    # Modify DC SH coefficients (brightness and color tint)
+    for ch, (attr, tint) in enumerate(zip(
+        ["f_dc_0", "f_dc_1", "f_dc_2"],
+        params.color_tint,
+    )):
+        if attr in vertices.data.dtype.names:
+            vals = np.array(vertices[attr], dtype=np.float64)
+            vals[ids] *= params.brightness * tint
+            vertices[attr] = vals.astype(np.float32)
+
+    # Scale higher-order SH bands
+    if params.sh_scale != 1.0:
+        for i in range(45):  # Up to SH degree 3
+            attr = f"f_rest_{i}"
+            if attr in vertices.data.dtype.names:
+                vals = np.array(vertices[attr], dtype=np.float64)
+                vals[ids] *= params.sh_scale
+                vertices[attr] = vals.astype(np.float32)
+
+    _write_ply_safe(plydata, ply_path)
+
+
+# ---------------------------------------------------------------------------
+# Inpaint Remove
+# ---------------------------------------------------------------------------
+
+@router.post("/{project_id}/segments/{segment_id}/inpaint-remove")
+async def inpaint_remove(
+    project_id: str,
+    segment_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove a segment and inpaint the hole."""
+    await _require_project(project_id, db)
+
+    project_dir = _get_project_dir(project_id)
+    manifest = _read_manifest(project_dir)
+    ply_path = project_dir / "scene.ply"
+    segment = _get_segment(manifest, segment_id)
+
+    if not segment.get("gaussian_ids"):
+        raise HTTPException(status_code=400, detail="Segment has no assigned gaussians")
+
+    _save_checkpoint(project_dir, f"inpaint-remove segment {segment_id}")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    try:
+        await loop.run_in_executor(
+            _segment_executor,
+            lambda: _inpaint_remove(ply_path, project_dir, manifest, segment),
+        )
+    except Exception as e:
+        logger.error(f"Inpaint removal failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Remove segment from manifest
+    manifest["segments"] = [s for s in manifest["segments"] if s["id"] != segment_id]
+    manifest["total"] = len(manifest["segments"])
+    _write_manifest(project_dir, manifest)
+
+    return {"status": "ok", "removed_gaussians": len(segment["gaussian_ids"])}
+
+
+def _inpaint_remove(ply_path: Path, project_dir: Path, manifest: dict, segment: dict):
+    """Remove segment gaussians. Inpainting pipeline runs if available, otherwise just hides."""
+    try:
+        from pipeline.inpaint_scene import inpaint_scene
+        inpaint_scene(ply_path, project_dir, segment)
+    except ImportError:
+        # Fallback: just set opacity to -100 (simple removal without inpainting)
+        logger.info("Inpainting pipeline not available, using simple removal")
+        _delete_gaussians(ply_path, segment["gaussian_ids"])
+
+
+def _regenerate_index_map(project_dir: Path, manifest: dict):
+    """Regenerate segment_index_map.bin from manifest."""
+    ply_path = project_dir / "scene.ply"
+    if not ply_path.exists():
+        return
+
+    total_gaussians = _get_ply_vertex_count(ply_path)
+    index_map = np.zeros(total_gaussians, dtype=np.uint8)
+
+    for list_idx, seg in enumerate(manifest.get("segments", [])):
+        seg_value = list_idx + 1
+        if seg_value > 255:
+            break
+        for gid in seg.get("gaussian_ids", []):
+            if 0 <= gid < total_gaussians:
+                index_map[gid] = seg_value
+
+    map_path = project_dir / "segment_index_map.bin"
+    map_path.write_bytes(index_map.tobytes())
+
+
+# ---------------------------------------------------------------------------
 # Response formatting
 # ---------------------------------------------------------------------------
 
@@ -862,6 +1423,7 @@ def _manifest_to_response(manifest: dict) -> dict:
             "n_gaussians": s.get("n_gaussians", len(s.get("gaussian_ids", []))),
             "click_point": s.get("click_point"),
             "visible": s.get("visible", True),
+            "semantic_confidence": s.get("semantic_confidence"),
         })
     return {
         "segments": segments,

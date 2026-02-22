@@ -620,3 +620,48 @@ async def stop_refinement(
         raise HTTPException(status_code=404, detail="No active refinement for this project")
     trainer.request_stop()
     return {"status": "stop_requested"}
+
+
+# --- Geometric Quality ---
+
+_geo_executor = ThreadPoolExecutor(max_workers=1)
+
+
+@router.get("/{project_id}/geometric-quality")
+async def get_geometric_quality(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Compute geometric quality measures from scene.ply + cameras.json.
+
+    Returns health_score (0-100), depth_consistency, edge_alignment,
+    alpha_coverage, health_components, and gaussian_stats.
+    """
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = settings.data_dir / "projects" / project_id
+    ply_path = project_dir / "scene.ply"
+    cameras_path = project_dir / "cameras.json"
+
+    if not ply_path.exists():
+        raise HTTPException(status_code=400, detail="No scene.ply found")
+    if not cameras_path.exists():
+        raise HTTPException(status_code=400, detail="No cameras.json found")
+
+    import asyncio
+    from pipeline.geometric_quality import compute_geometric_quality
+
+    loop = asyncio.get_event_loop()
+    try:
+        result_data = await loop.run_in_executor(
+            _geo_executor,
+            lambda: compute_geometric_quality(ply_path, cameras_path),
+        )
+    except Exception as e:
+        logger.error(f"Geometric quality failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return result_data

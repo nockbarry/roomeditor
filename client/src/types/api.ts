@@ -4,7 +4,7 @@ export interface Project {
   status: "created" | "uploaded" | "processing" | "ready" | "error";
   video_filename: string | null;
   gaussian_count: number | null;
-  reconstruction_mode: "anysplat" | "training" | null;
+  reconstruction_mode: "anysplat" | "spfsplat" | "training" | null;
   error_message: string | null;
   created_at: string;
   updated_at: string;
@@ -72,7 +72,7 @@ export interface TrainingConfig {
   iterations: number;
   sh_degree: number;
   mode: "3dgs" | "2dgs";
-  sfm_backend: "colmap" | "mast3r" | "anysplat";
+  sfm_backend: "colmap" | "mast3r" | "anysplat" | "spfsplat";
   mast3r_image_size: number;
   depth_reg_weight: number;
   opacity_reg_weight: number;
@@ -144,6 +144,7 @@ export interface SegmentInfo {
   n_gaussians: number;
   click_point: [number, number] | null;
   visible: boolean;
+  semantic_confidence?: number;
 }
 
 export interface SegmentManifest {

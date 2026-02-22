@@ -206,6 +206,7 @@ async def list_checkpoints(project_id: str, db: AsyncSession = Depends(get_db)):
 async def extract_mesh_endpoint(
     project_id: str,
     voxel_size: float = 0.02,
+    format: str = "glb",
     db: AsyncSession = Depends(get_db),
 ):
     """Extract a triangle mesh from the trained Gaussian model via TSDF fusion."""
@@ -216,50 +217,97 @@ async def extract_mesh_endpoint(
     if project.status != "ready":
         raise HTTPException(status_code=400, detail="Project must be reconstructed first")
 
+    if format not in ("glb", "obj", "ply"):
+        raise HTTPException(status_code=400, detail="Format must be glb, obj, or ply")
+
     project_dir = settings.data_dir / "projects" / project_id
     ply_path = project_dir / "scene.ply"
-    colmap_dir = project_dir / "colmap"
     frames_dir = project_dir / "frames"
-    mesh_path = project_dir / "mesh.glb"
+    mesh_path = project_dir / f"mesh.{format}"
 
     if not ply_path.exists():
         raise HTTPException(status_code=400, detail="No scene.ply found")
 
-    # Find the best COLMAP model directory
-    model_dirs = sorted(colmap_dir.glob("*"))
-    model_dir = model_dirs[0] if model_dirs else colmap_dir
-    if not (model_dir / "cameras.bin").exists():
-        # Try numbered subdirectories
-        for d in sorted(colmap_dir.iterdir()):
-            if d.is_dir() and (d / "cameras.bin").exists():
-                model_dir = d
-                break
+    # Load cameras: prefer cameras.json (AnySplat), fall back to COLMAP
+    cameras_path = project_dir / "cameras.json"
+    colmap_dir = project_dir / "colmap"
 
     loop = asyncio.get_event_loop()
 
+    from app.routes.ws import broadcast_stream_update
+
+    def _on_progress(frac):
+        asyncio.run_coroutine_threadsafe(
+            broadcast_stream_update(project_id, {
+                "type": "mesh_progress",
+                "progress": round(frac, 3),
+            }),
+            loop,
+        )
+
     def _extract():
+        from pipeline.extract_mesh import extract_mesh, load_params_from_ply
         from pipeline.train_gaussians import GaussianTrainer, TrainerConfig
-        from pipeline.extract_mesh import extract_mesh
+        import json
+        import numpy as np
 
         config = TrainerConfig(mode="3dgs")
         trainer = GaussianTrainer(config)
-        points3d, colors3d = trainer.load_data(model_dir, frames_dir)
-        trainer.init_params(points3d, colors3d)
 
-        # Load the trained PLY instead of the init params
+        # Load trained Gaussian params directly from scene.ply
+        params_dict = load_params_from_ply(ply_path)
+        trainer.init_params(params_dict["means"], params_dict["colors"])
+
+        # Override with full trained params (scales, quats, opacities, SH)
         import torch
-        from gsplat import export_splats
-        # Re-load trained weights from PLY
-        # For simplicity, we just use the trainer as-is for rasterization
-        # after loading COLMAP data (the actual Gaussian params come from init)
-        # TODO: Load PLY params directly for more accurate mesh extraction
+        for key in ("scales", "quats", "opacities", "sh0", "shN"):
+            if key in params_dict and key in trainer.params:
+                trainer.params[key] = torch.nn.Parameter(params_dict[key].to(trainer.device))
+
+        # Load camera data
+        if cameras_path.exists():
+            with open(cameras_path) as f:
+                cam_data = json.load(f)
+            resolution = cam_data.get("resolution", 448)
+            default_focal = cam_data.get("focal_length_px", resolution * 0.85)
+            cameras_data = []
+            for cam in cam_data["cameras"]:
+                transform = np.array(cam["transform"], dtype=np.float32)
+                if transform.shape == (3, 4):
+                    c2w = np.eye(4, dtype=np.float32)
+                    c2w[:3, :] = transform
+                else:
+                    c2w = transform
+                viewmat = np.linalg.inv(c2w).astype(np.float32)
+                fx = cam.get("fx", default_focal)
+                fy = cam.get("fy", default_focal)
+                cx = cam.get("cx", resolution / 2)
+                cy = cam.get("cy", resolution / 2)
+                K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+                cameras_data.append({
+                    "K": K, "viewmat": viewmat,
+                    "width": resolution, "height": resolution,
+                })
+            trainer.cameras_data = cameras_data
+        elif colmap_dir.exists():
+            # Fall back to COLMAP cameras
+            model_dirs = sorted(colmap_dir.glob("*"))
+            model_dir = model_dirs[0] if model_dirs else colmap_dir
+            if not (model_dir / "cameras.bin").exists():
+                for d in sorted(colmap_dir.iterdir()):
+                    if d.is_dir() and (d / "cameras.bin").exists():
+                        model_dir = d
+                        break
+            trainer.load_data(model_dir, frames_dir)
+        else:
+            raise RuntimeError("No cameras.json or COLMAP data found for mesh extraction")
 
         trainer.init_strategy()
-        return extract_mesh(trainer, mesh_path, voxel_size=voxel_size)
+        return extract_mesh(trainer, mesh_path, voxel_size=voxel_size, progress_callback=_on_progress)
 
     mesh_info = await loop.run_in_executor(_mesh_executor, _extract)
 
     return {
-        "mesh_url": f"/data/{project_id}/mesh.glb",
+        "mesh_url": f"/data/{project_id}/mesh.{format}",
         **mesh_info,
     }

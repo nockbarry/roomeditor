@@ -5,6 +5,17 @@ export async function autoSegment(projectId: string): Promise<SegmentManifest> {
   return api.post<SegmentManifest>(`/projects/${projectId}/auto-segment`);
 }
 
+export async function autoSegmentFull(projectId: string): Promise<SegmentManifest> {
+  return api.post<SegmentManifest>(`/projects/${projectId}/auto-segment-full`);
+}
+
+export async function deleteGaussians(
+  projectId: string,
+  gaussianIds: number[]
+): Promise<{ status: string; removed_gaussians: number }> {
+  return api.post(`/projects/${projectId}/delete-gaussians`, { gaussian_ids: gaussianIds });
+}
+
 export async function clickSegment(
   projectId: string,
   frame: string,
@@ -91,6 +102,62 @@ export async function fetchSegmentIndexMap(projectId: string): Promise<Uint8Arra
   if (!res.ok) throw new Error(`Failed to fetch segment index map: ${res.status}`);
   const buf = await res.arrayBuffer();
   return new Uint8Array(buf);
+}
+
+export async function classifySegments(projectId: string): Promise<SegmentManifest> {
+  return api.post<SegmentManifest>(`/projects/${projectId}/classify-segments`);
+}
+
+export async function mergeSegments(
+  projectId: string,
+  segmentIds: number[],
+  label?: string
+): Promise<SegmentManifest> {
+  return api.post<SegmentManifest>(`/projects/${projectId}/segments/merge`, {
+    segment_ids: segmentIds,
+    label: label ?? null,
+  });
+}
+
+export async function splitSegment(
+  projectId: string,
+  segmentId: number,
+  nClusters: number = 2
+): Promise<SegmentManifest> {
+  return api.post<SegmentManifest>(
+    `/projects/${projectId}/segments/${segmentId}/split`,
+    { n_clusters: nClusters }
+  );
+}
+
+export async function exportSegmentMesh(
+  projectId: string,
+  segmentId: number,
+  format: string = "glb"
+): Promise<{ mesh_url: string }> {
+  return api.post(`/projects/${projectId}/segments/${segmentId}/extract-mesh?format=${format}`);
+}
+
+export async function exportSegmentPly(
+  projectId: string,
+  segmentId: number
+): Promise<{ ply_url: string }> {
+  return api.post(`/projects/${projectId}/segments/${segmentId}/export-ply`);
+}
+
+export async function adjustLighting(
+  projectId: string,
+  segmentId: number,
+  params: { brightness?: number; color_tint?: number[]; sh_scale?: number }
+): Promise<{ status: string }> {
+  return api.put(`/projects/${projectId}/segments/${segmentId}/lighting`, params);
+}
+
+export async function inpaintRemoveSegment(
+  projectId: string,
+  segmentId: number
+): Promise<{ status: string }> {
+  return api.post(`/projects/${projectId}/segments/${segmentId}/inpaint-remove`);
 }
 
 export async function getUndoStack(

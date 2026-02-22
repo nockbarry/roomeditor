@@ -13,6 +13,69 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def load_params_from_ply(ply_path: Path) -> dict:
+    """Load Gaussian splat parameters from a PLY file into torch tensors.
+
+    Returns dict with keys: means, colors, scales, quats, opacities, sh0, shN
+    matching the trainer param format.
+    """
+    from plyfile import PlyData
+
+    plydata = PlyData.read(str(ply_path))
+    vertex = plydata["vertex"]
+    n_pts = len(vertex.data)
+    names = vertex.data.dtype.names
+
+    means = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=-1).astype(np.float32)
+
+    # Extract DC color from SH coefficients
+    if "f_dc_0" in names:
+        C0 = 0.28209479177387814
+        r = np.array(vertex["f_dc_0"]) * C0 + 0.5
+        g = np.array(vertex["f_dc_1"]) * C0 + 0.5
+        b = np.array(vertex["f_dc_2"]) * C0 + 0.5
+        colors = np.stack([r, g, b], axis=-1).clip(0, 1).astype(np.float32)
+    else:
+        colors = np.ones((n_pts, 3), dtype=np.float32) * 0.5
+
+    result = {"means": means, "colors": colors}
+
+    # Scales
+    if "scale_0" in names:
+        scales = np.stack([vertex["scale_0"], vertex["scale_1"], vertex["scale_2"]], axis=-1).astype(np.float32)
+        result["scales"] = torch.tensor(scales)
+
+    # Quaternions
+    if "rot_0" in names:
+        quats = np.stack([vertex["rot_0"], vertex["rot_1"], vertex["rot_2"], vertex["rot_3"]], axis=-1).astype(np.float32)
+        result["quats"] = torch.tensor(quats)
+
+    # Opacities
+    if "opacity" in names:
+        opacities = np.array(vertex["opacity"], dtype=np.float32).reshape(-1, 1)
+        result["opacities"] = torch.tensor(opacities)
+
+    # SH coefficients (DC)
+    if "f_dc_0" in names:
+        sh0 = np.stack([vertex["f_dc_0"], vertex["f_dc_1"], vertex["f_dc_2"]], axis=-1).astype(np.float32)
+        result["sh0"] = torch.tensor(sh0.reshape(n_pts, 1, 3))
+
+    # Higher-order SH
+    sh_rest = []
+    for i in range(45):
+        key = f"f_rest_{i}"
+        if key not in names:
+            break
+        sh_rest.append(np.array(vertex[key], dtype=np.float32))
+    if sh_rest:
+        sh_rest_arr = np.stack(sh_rest, axis=-1).astype(np.float32)
+        n_coeffs = len(sh_rest) // 3
+        result["shN"] = torch.tensor(sh_rest_arr.reshape(n_pts, n_coeffs, 3))
+
+    logger.info(f"Loaded {n_pts:,} Gaussians from {ply_path}")
+    return result
+
+
 class TSDFVolume:
     """Truncated Signed Distance Function volume for depth fusion."""
 

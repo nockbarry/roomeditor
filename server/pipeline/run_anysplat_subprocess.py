@@ -76,21 +76,35 @@ def run_anysplat_subprocess(
     env = {**os.environ, "CUDA_HOME": CUDA_HOME, "PYTHONUNBUFFERED": "1"}
 
     cameras_path = output_ply.with_name("cameras.json")
-    script = ANYSPLAT_DIR / "run_inference_max.py"
-    cmd = [
-        str(ANYSPLAT_PYTHON), str(script),
-        "--images_dir", str(images_dir),
-        "--output_ply", str(output_ply),
-        "--max_views", str(max_views),
-        "--fp16",
-        "--resolution", str(resolution),
-        "--output_meta", str(meta_path),
-        "--output_cameras", str(cameras_path),
-        "--full_sh",
-    ]
 
     if chunked and chunk_size > 0:
-        cmd.extend(["--chunk_size", str(chunk_size), "--chunk_overlap", str(chunk_overlap)])
+        # Use run_inference_chunked.py for proper Umeyama-aligned chunk merging
+        script = ANYSPLAT_DIR / "run_inference_chunked.py"
+        cmd = [
+            str(ANYSPLAT_PYTHON), str(script),
+            "--images_dir", str(images_dir),
+            "--output_ply", str(output_ply),
+            "--chunk_size", str(chunk_size),
+            "--chunk_overlap", str(chunk_overlap),
+            "--fp16",
+            "--resolution", str(resolution),
+            "--output_meta", str(meta_path),
+            "--output_cameras", str(cameras_path),
+            "--full_sh",
+        ]
+    else:
+        script = ANYSPLAT_DIR / "run_inference_max.py"
+        cmd = [
+            str(ANYSPLAT_PYTHON), str(script),
+            "--images_dir", str(images_dir),
+            "--output_ply", str(output_ply),
+            "--max_views", str(max_views),
+            "--fp16",
+            "--resolution", str(resolution),
+            "--output_meta", str(meta_path),
+            "--output_cameras", str(cameras_path),
+            "--full_sh",
+        ]
 
     mode_str = f"chunked({chunk_size}/{chunk_overlap})" if chunked else "single-pass"
     logger.info(f"AnySplat: {max_views} views @ {resolution}px fp16 [{mode_str}]")
@@ -100,12 +114,20 @@ def run_anysplat_subprocess(
 
     logger.info(f"Running: {' '.join(cmd)}")
 
+    # Dynamic timeout: chunked runs take longer
+    if chunked and chunk_size > 0:
+        stride = max(1, chunk_size - chunk_overlap)
+        est_chunks = max(1, (max_views - chunk_overlap) // stride + 1)
+        timeout = 300 + est_chunks * 60
+    else:
+        timeout = 600
+
     result = subprocess.run(
         cmd,
         env=env,
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=timeout,
     )
 
     if result.returncode != 0:

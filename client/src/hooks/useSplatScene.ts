@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import { buildKDTree, queryNearest, type KDTreeNode } from "./useKDTree.ts";
+import type { ToolMode } from "../types/scene.ts";
 
 /** Max f_rest properties Spark supports (SH degree 3 = 45). */
 const MAX_F_REST = 45;
@@ -148,6 +150,12 @@ function extractPlyPositions(buf: ArrayBuffer): {
   return { positions, nVerts, centroid, radius: Math.sqrt(maxDistSq) };
 }
 
+export interface GizmoDelta {
+  translation?: [number, number, number];
+  rotation?: [number, number, number];
+  scale?: [number, number, number];
+}
+
 export interface SplatSceneHandle {
   containerRef: React.RefObject<HTMLDivElement | null>;
   loading: boolean;
@@ -156,10 +164,14 @@ export interface SplatSceneHandle {
   loadPly: (url: string) => void;
   splatMeshRef: React.RefObject<SplatMesh | null>;
   positionsRef: React.RefObject<Float32Array | null>;
+  sceneRef: React.RefObject<THREE.Scene | null>;
+  cameraRef: React.RefObject<THREE.PerspectiveCamera | null>;
   onPickRef: React.RefObject<
     ((splatIdx: number | null, point: THREE.Vector3 | null) => void) | null
   >;
   onHoverRef: React.RefObject<((splatIdx: number | null) => void) | null>;
+  onGizmoDragEndRef: React.RefObject<((delta: GizmoDelta) => void) | null>;
+  updateGizmo: (centroid: THREE.Vector3 | null, mode: ToolMode) => void;
 }
 
 export function useSplatScene(): SplatSceneHandle {
@@ -177,6 +189,12 @@ export function useSplatScene(): SplatSceneHandle {
     ((splatIdx: number | null, point: THREE.Vector3 | null) => void) | null
   >(null);
   const onHoverRef = useRef<((splatIdx: number | null) => void) | null>(null);
+  const onGizmoDragEndRef = useRef<((delta: GizmoDelta) => void) | null>(null);
+  const transformControlsRef = useRef<TransformControls | null>(null);
+  const proxyMeshRef = useRef<THREE.Mesh | null>(null);
+  const proxyStartPosRef = useRef<THREE.Vector3 | null>(null);
+  const proxyStartQuatRef = useRef<THREE.Quaternion | null>(null);
+  const proxyStartScaleRef = useRef<THREE.Vector3 | null>(null);
   const initedRef = useRef(false);
   const loadIdRef = useRef(0);
 
@@ -519,6 +537,121 @@ export function useSplatScene(): SplatSceneHandle {
       });
   }, []);
 
+  const updateGizmo = useCallback(
+    (centroid: THREE.Vector3 | null, mode: ToolMode) => {
+      const scene = sceneRef.current;
+      const camera = cameraRef.current;
+      const renderer = rendererRef.current;
+      const controls = controlsRef.current;
+
+      if (!scene || !camera || !renderer || !controls) return;
+
+      // Remove existing gizmo
+      if (transformControlsRef.current) {
+        transformControlsRef.current.detach();
+        scene.remove(transformControlsRef.current as unknown as THREE.Object3D);
+        transformControlsRef.current.dispose();
+        transformControlsRef.current = null;
+      }
+      if (proxyMeshRef.current) {
+        scene.remove(proxyMeshRef.current);
+        proxyMeshRef.current.geometry.dispose();
+        (proxyMeshRef.current.material as THREE.Material).dispose();
+        proxyMeshRef.current = null;
+      }
+
+      if (!centroid || mode === "select") return;
+
+      // Create invisible proxy mesh at segment centroid
+      // Transform centroid through frame group (Y-down -> Y-up: negate Y and Z)
+      const frameGroup = frameGroupRef.current;
+      const worldCentroid = centroid.clone();
+      if (frameGroup) {
+        worldCentroid.applyQuaternion(frameGroup.quaternion);
+      }
+
+      const proxy = new THREE.Mesh(
+        new THREE.SphereGeometry(0.02, 8, 8),
+        new THREE.MeshBasicMaterial({ visible: false })
+      );
+      proxy.position.copy(worldCentroid);
+      scene.add(proxy);
+      proxyMeshRef.current = proxy;
+
+      // Save starting transform
+      proxyStartPosRef.current = proxy.position.clone();
+      proxyStartQuatRef.current = proxy.quaternion.clone();
+      proxyStartScaleRef.current = proxy.scale.clone();
+
+      // Create TransformControls
+      const tc = new TransformControls(camera, renderer.domElement);
+      const modeMap: Record<string, "translate" | "rotate" | "scale"> = {
+        translate: "translate",
+        rotate: "rotate",
+        scale: "scale",
+      };
+      tc.setMode(modeMap[mode] || "translate");
+      tc.setSize(0.8);
+      tc.attach(proxy);
+      scene.add(tc as unknown as THREE.Object3D);
+      transformControlsRef.current = tc;
+
+      // Disable orbit controls during gizmo drag
+      tc.addEventListener("dragging-changed", (event: { value: unknown }) => {
+        const dragging = !!event.value;
+        controls.enabled = !dragging;
+
+        // On drag end: compute delta and fire callback
+        if (!dragging) {
+          const cb = onGizmoDragEndRef.current;
+          if (!cb) return;
+
+          const startPos = proxyStartPosRef.current;
+          const startQuat = proxyStartQuatRef.current;
+          const startScale = proxyStartScaleRef.current;
+          if (!startPos || !startQuat || !startScale) return;
+
+          const delta: GizmoDelta = {};
+
+          if (mode === "translate") {
+            const dp = new THREE.Vector3().subVectors(proxy.position, startPos);
+            // Transform back through frame group inverse
+            if (frameGroup) {
+              const invQ = frameGroup.quaternion.clone().invert();
+              dp.applyQuaternion(invQ);
+            }
+            delta.translation = [dp.x, dp.y, dp.z];
+          } else if (mode === "rotate") {
+            const dq = startQuat.clone().invert().multiply(proxy.quaternion);
+            const euler = new THREE.Euler().setFromQuaternion(dq, "XYZ");
+            let rx = THREE.MathUtils.radToDeg(euler.x);
+            let ry = THREE.MathUtils.radToDeg(euler.y);
+            let rz = THREE.MathUtils.radToDeg(euler.z);
+            // Transform rotation through frame group coordinate space
+            if (frameGroup) {
+              ry = -ry;
+              rz = -rz;
+            }
+            delta.rotation = [rx, ry, rz];
+          } else if (mode === "scale") {
+            const sx = proxy.scale.x / startScale.x;
+            const sy = proxy.scale.y / startScale.y;
+            const sz = proxy.scale.z / startScale.z;
+            delta.scale = [sx, sy, sz];
+          }
+
+          cb(delta);
+
+          // Reset proxy for next drag
+          proxyStartPosRef.current = proxy.position.clone();
+          proxyStartQuatRef.current = proxy.quaternion.clone();
+          proxyStartScaleRef.current = proxy.scale.clone();
+        }
+      });
+    },
+    []
+  );
+
   return {
     containerRef,
     loading,
@@ -527,7 +660,11 @@ export function useSplatScene(): SplatSceneHandle {
     loadPly,
     splatMeshRef,
     positionsRef,
+    sceneRef,
+    cameraRef,
     onPickRef,
     onHoverRef,
+    onGizmoDragEndRef,
+    updateGizmo,
   };
 }

@@ -220,8 +220,78 @@ export const PRESETS_ANYSPLAT: Preset[] = [
   },
 ];
 
-export function getPresets(mode: "3dgs" | "2dgs" | "anysplat"): Preset[] {
+export const PRESETS_SPFSPLAT: Preset[] = [
+  {
+    name: "Quick",
+    description: "4 views @ 256px",
+    estimatedTime: "~3 sec",
+    config: {
+      iterations: 0,
+      sh_degree: 0,
+      mode: "3dgs",
+      sfm_backend: "spfsplat",
+      mast3r_image_size: 256,
+      depth_reg_weight: 0,
+      opacity_reg_weight: 0,
+      scale_reg_weight: 0,
+      flatten_reg_weight: 0,
+      distortion_weight: 0,
+      normal_weight: 0,
+      prune_opa: 0,
+      densify_until_pct: 0,
+      appearance_embeddings: false,
+      tidi_pruning: false,
+    },
+  },
+  {
+    name: "Standard",
+    description: "6 views @ 256px",
+    estimatedTime: "~4 sec",
+    config: {
+      iterations: 0,
+      sh_degree: 0,
+      mode: "3dgs",
+      sfm_backend: "spfsplat",
+      mast3r_image_size: 256,
+      depth_reg_weight: 0,
+      opacity_reg_weight: 0,
+      scale_reg_weight: 0,
+      flatten_reg_weight: 0,
+      distortion_weight: 0,
+      normal_weight: 0,
+      prune_opa: 0,
+      densify_until_pct: 0,
+      appearance_embeddings: false,
+      tidi_pruning: false,
+    },
+  },
+  {
+    name: "Maximum",
+    description: "8 views @ 256px (model limit)",
+    estimatedTime: "~5 sec",
+    config: {
+      iterations: 0,
+      sh_degree: 0,
+      mode: "3dgs",
+      sfm_backend: "spfsplat",
+      mast3r_image_size: 256,
+      depth_reg_weight: 0,
+      opacity_reg_weight: 0,
+      scale_reg_weight: 0,
+      flatten_reg_weight: 0,
+      distortion_weight: 0,
+      normal_weight: 0,
+      prune_opa: 0,
+      densify_until_pct: 0,
+      appearance_embeddings: false,
+      tidi_pruning: false,
+    },
+  },
+];
+
+export function getPresets(mode: "3dgs" | "2dgs" | "anysplat" | "spfsplat"): Preset[] {
   if (mode === "anysplat") return PRESETS_ANYSPLAT;
+  if (mode === "spfsplat") return PRESETS_SPFSPLAT;
   return mode === "2dgs" ? PRESETS_2DGS : PRESETS_3DGS;
 }
 

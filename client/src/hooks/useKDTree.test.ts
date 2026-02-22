@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildKDTree, queryNearest, KDTreeNode } from "./useKDTree";
+import { buildKDTree, queryNearest, type KDTreeNode } from "./useKDTree";
 
 /** Brute-force nearest neighbor for reference validation. */
 function bruteForceNearest(positions: Float32Array, px: number, py: number, pz: number): number {

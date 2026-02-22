@@ -1,7 +1,15 @@
 """Rasterizer abstraction for 3DGS and 2DGS backends."""
 
 import io
+import os
 from dataclasses import dataclass
+from pathlib import Path
+
+# Ensure CUDA_HOME is set for gsplat JIT compilation
+if "CUDA_HOME" not in os.environ:
+    _cuda_path = Path.home() / ".local" / "cuda-12.8"
+    if _cuda_path.exists():
+        os.environ["CUDA_HOME"] = str(_cuda_path)
 
 import numpy as np
 import torch

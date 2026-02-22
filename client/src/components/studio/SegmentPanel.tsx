@@ -1,5 +1,7 @@
 import { useSegmentStore } from "../../stores/segmentStore.ts";
 import { useAnySplatStore } from "../../stores/anysplatStore.ts";
+import { useCollabStore } from "../../stores/collabStore.ts";
+import { SkeletonSegmentList } from "../ui/Skeleton.tsx";
 import {
   Scan,
   Loader2,
@@ -12,6 +14,13 @@ import {
   RotateCcw,
   Copy,
   Layers,
+  Tag,
+  Merge,
+  Split,
+  Box,
+  Sun,
+  Wand2,
+  Lock,
 } from "lucide-react";
 import { useState, useEffect, useCallback } from "react";
 
@@ -27,11 +36,21 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
   const hoveredSegmentId = useSegmentStore((s) => s.hoveredSegmentId);
   const isSegmenting = useSegmentStore((s) => s.isSegmenting);
   const isAssigning = useSegmentStore((s) => s.isAssigning);
+  const isClassifying = useSegmentStore((s) => s.isClassifying);
+  const isMerging = useSegmentStore((s) => s.isMerging);
+  const isSplitting = useSegmentStore((s) => s.isSplitting);
+  const isInpainting = useSegmentStore((s) => s.isInpainting);
   const totalGaussians = useSegmentStore((s) => s.totalGaussians);
   const unassignedGaussians = useSegmentStore((s) => s.unassignedGaussians);
   const undoCount = useSegmentStore((s) => s.undoCount);
   const autoSegment = useSegmentStore((s) => s.autoSegment);
+  const autoSegmentFull = useSegmentStore((s) => s.autoSegmentFull);
   const assignGaussians = useSegmentStore((s) => s.assignGaussians);
+  const classifySegments = useSegmentStore((s) => s.classifySegments);
+  const mergeSegments = useSegmentStore((s) => s.mergeSegments);
+  const splitSegment = useSegmentStore((s) => s.splitSegment);
+  const adjustLighting = useSegmentStore((s) => s.adjustLighting);
+  const inpaintRemove = useSegmentStore((s) => s.inpaintRemove);
   const selectSegment = useSegmentStore((s) => s.selectSegment);
   const toggleSelectSegment = useSegmentStore((s) => s.toggleSelectSegment);
   const rangeSelectSegment = useSegmentStore((s) => s.rangeSelectSegment);
@@ -46,10 +65,17 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
   const fetchUndoCount = useSegmentStore((s) => s.fetchUndoCount);
   const setHoveredSegment = useSegmentStore((s) => s.setHoveredSegment);
 
+  const lockedSegments = useCollabStore((s) => s.lockedSegments);
+  const collabUsers = useCollabStore((s) => s.users);
+
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [editingLabelId, setEditingLabelId] = useState<number | null>(null);
   const [editLabel, setEditLabel] = useState("");
   const [step, setStep] = useState(0.1);
+  const [splitClusters, setSplitClusters] = useState(2);
+  const [showLighting, setShowLighting] = useState<number | null>(null);
+  const [brightness, setBrightness] = useState(1.0);
+  const [meshExporting, setMeshExporting] = useState<number | null>(null);
 
   useEffect(() => {
     fetchUndoCount(projectId);
@@ -111,6 +137,40 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
     await createBackground(projectId);
   };
 
+  const handleMerge = async () => {
+    if (selectedSegmentIds.length < 2) return;
+    await mergeSegments(projectId, selectedSegmentIds);
+    bumpPly();
+  };
+
+  const handleSplit = async (segId: number) => {
+    await splitSegment(projectId, segId, splitClusters);
+    bumpPly();
+  };
+
+  const handleExportSegmentMesh = async (segId: number) => {
+    setMeshExporting(segId);
+    try {
+      const { exportSegmentMesh } = await import("../../api/segments.ts");
+      const result = await exportSegmentMesh(projectId, segId, "glb");
+      window.open(result.mesh_url, "_blank");
+    } catch (e) {
+      console.error("Segment mesh export failed:", e);
+    } finally {
+      setMeshExporting(null);
+    }
+  };
+
+  const handleLightingApply = async (segId: number) => {
+    await adjustLighting(projectId, segId, { brightness });
+    bumpPly();
+  };
+
+  const handleInpaint = async (segId: number) => {
+    await inpaintRemove(projectId, segId);
+    bumpPly();
+  };
+
   const selectedSegments = segments.filter((s) => selectedSegmentIds.includes(s.id));
   const hasGaussians = selectedSegments.some((s) => s.n_gaussians > 0);
 
@@ -121,7 +181,7 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
         <button
           onClick={handleUndo}
           disabled={undoCount === 0}
-          title={undoCount > 0 ? `Undo (${undoCount} available)` : "Nothing to undo"}
+          title={undoCount > 0 ? `Undo (${undoCount} available) [Ctrl+Z]` : "Nothing to undo"}
           className="p-1.5 rounded hover:bg-gray-800 disabled:opacity-30 transition-colors"
         >
           <Undo2 className="w-3.5 h-3.5" />
@@ -152,22 +212,47 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
       {/* Segment action buttons */}
       <div className="px-3 py-3 border-b border-gray-800 space-y-2">
         <button
-          onClick={() => autoSegment(projectId)}
+          onClick={() => autoSegmentFull(projectId)}
           disabled={isSegmenting}
           className="w-full bg-violet-600 hover:bg-violet-500 disabled:opacity-50 px-3 py-2 rounded-lg text-xs font-medium transition-colors flex items-center justify-center gap-2"
         >
           {isSegmenting ? (
             <>
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              Detecting objects...
+              Segmenting scene...
             </>
           ) : (
             <>
               <Scan className="w-3.5 h-3.5" />
-              Detect Objects (SAM2)
+              Auto Segment Scene
             </>
           )}
         </button>
+
+        <div className="flex gap-1.5">
+          <button
+            onClick={() => autoSegment(projectId)}
+            disabled={isSegmenting}
+            className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 px-2 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5"
+          >
+            <Scan className="w-3 h-3" />
+            Detect Only
+          </button>
+          {segments.length > 0 && (
+            <button
+              onClick={() => classifySegments(projectId)}
+              disabled={isClassifying}
+              className="flex-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 px-2 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5"
+            >
+              {isClassifying ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Tag className="w-3 h-3" />
+              )}
+              Auto-Label
+            </button>
+          )}
+        </div>
 
         {segments.length > 0 && (
           <button
@@ -206,6 +291,22 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
           <div className="text-[10px] text-gray-500 uppercase tracking-wider">
             Transform ({selectedSegmentIds.length} selected)
           </div>
+
+          {/* Merge button (when 2+ selected) */}
+          {selectedSegmentIds.length >= 2 && (
+            <button
+              onClick={handleMerge}
+              disabled={isMerging}
+              className="w-full bg-gray-800 hover:bg-gray-700 disabled:opacity-50 px-3 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5"
+            >
+              {isMerging ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Merge className="w-3 h-3" />
+              )}
+              Merge Selected
+            </button>
+          )}
 
           {/* Translate */}
           <div>
@@ -298,6 +399,9 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
 
       {/* Segment list */}
       <div className="flex-1 overflow-y-auto">
+        {isSegmenting && segments.length === 0 && (
+          <SkeletonSegmentList count={6} />
+        )}
         {segments.length === 0 && !isSegmenting && (
           <div className="p-3 text-center">
             <p className="text-xs text-gray-600">
@@ -312,6 +416,9 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
         {segments.map((seg) => {
           const isSelected = selectedSegmentIds.includes(seg.id);
           const isHovered = hoveredSegmentId === seg.id;
+          const lockedBy = lockedSegments.get(seg.id);
+          const isLocked = !!lockedBy;
+          const lockUser = lockedBy ? collabUsers.find((u) => u.user_id === lockedBy) : null;
           return (
             <div
               key={seg.id}
@@ -359,6 +466,11 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
                       }}
                     >
                       {seg.label}
+                      {seg.semantic_confidence != null && (
+                        <span className="ml-1 text-[9px] text-emerald-400/60">
+                          {(seg.semantic_confidence * 100).toFixed(0)}%
+                        </span>
+                      )}
                     </span>
                   )}
                   {seg.n_gaussians > 0 && (
@@ -373,14 +485,28 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
                   />
                 </button>
 
+                {/* Lock indicator */}
+                {isLocked && (
+                  <div
+                    className="p-1 shrink-0"
+                    title={`Locked by ${lockedBy}`}
+                  >
+                    <Lock
+                      className="w-3 h-3"
+                      style={{ color: lockUser?.color ?? "#f59e0b" }}
+                    />
+                  </div>
+                )}
+
                 {/* Quick actions */}
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     handleVisibility(seg.id, !seg.visible);
                   }}
-                  className="p-1.5 hover:bg-gray-800 rounded transition-colors mr-1"
-                  title={seg.visible ? "Hide" : "Show"}
+                  disabled={isLocked}
+                  className="p-1.5 hover:bg-gray-800 rounded transition-colors mr-1 disabled:opacity-30"
+                  title={isLocked ? `Locked by another user` : seg.visible ? "Hide" : "Show"}
                 >
                   {seg.visible ? (
                     <Eye className="w-3 h-3 text-gray-500" />
@@ -398,6 +524,7 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
                     <span>IoU: {(seg.confidence * 100).toFixed(0)}%</span>
                   </div>
 
+                  {/* Row 1: Duplicate / Delete */}
                   <div className="flex gap-1">
                     <button
                       onClick={() => handleDuplicate(seg.id)}
@@ -415,6 +542,75 @@ export function SegmentPanel({ projectId }: SegmentPanelProps) {
                       Delete
                     </button>
                   </div>
+
+                  {/* Row 2: Split / Export Mesh */}
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => handleSplit(seg.id)}
+                      disabled={!seg.n_gaussians || isSplitting}
+                      className="flex-1 flex items-center justify-center gap-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-30 text-[10px] py-1.5 rounded"
+                    >
+                      {isSplitting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Split className="w-3 h-3" />}
+                      Split
+                    </button>
+                    <select
+                      value={splitClusters}
+                      onChange={(e) => setSplitClusters(Number(e.target.value))}
+                      className="w-10 bg-gray-900 border border-gray-800 rounded text-[10px] text-gray-400 focus:outline-none"
+                    >
+                      {[2, 3, 4].map((n) => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={() => handleExportSegmentMesh(seg.id)}
+                      disabled={!seg.n_gaussians || meshExporting === seg.id}
+                      className="flex-1 flex items-center justify-center gap-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-30 text-[10px] py-1.5 rounded"
+                    >
+                      {meshExporting === seg.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Box className="w-3 h-3" />}
+                      Export Mesh
+                    </button>
+                  </div>
+
+                  {/* Row 3: Lighting / Inpaint Remove */}
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => setShowLighting(showLighting === seg.id ? null : seg.id)}
+                      disabled={!seg.n_gaussians}
+                      className="flex-1 flex items-center justify-center gap-1 bg-gray-800 hover:bg-gray-700 disabled:opacity-30 text-[10px] py-1.5 rounded"
+                    >
+                      <Sun className="w-3 h-3" />
+                      Lighting
+                    </button>
+                    <button
+                      onClick={() => handleInpaint(seg.id)}
+                      disabled={!seg.n_gaussians || isInpainting}
+                      className="flex-1 flex items-center justify-center gap-1 bg-amber-900/30 hover:bg-amber-900/50 disabled:opacity-30 text-amber-400 text-[10px] py-1.5 rounded"
+                    >
+                      {isInpainting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wand2 className="w-3 h-3" />}
+                      Remove & Fill
+                    </button>
+                  </div>
+
+                  {/* Lighting controls (collapsible) */}
+                  {showLighting === seg.id && (
+                    <div className="space-y-1 bg-gray-900/50 rounded p-2">
+                      <div className="flex justify-between text-[10px] text-gray-500">
+                        <span>Brightness</span>
+                        <span>{brightness.toFixed(2)}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={2}
+                        step={0.05}
+                        value={brightness}
+                        onChange={(e) => setBrightness(Number(e.target.value))}
+                        onMouseUp={() => handleLightingApply(seg.id)}
+                        className="w-full accent-amber-500"
+                      />
+                    </div>
+                  )}
                 </div>
               )}
             </div>

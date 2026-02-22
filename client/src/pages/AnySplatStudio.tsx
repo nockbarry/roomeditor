@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useAnySplatStore } from "../stores/anysplatStore.ts";
 import { useProjectStore } from "../stores/projectStore.ts";
 import { useSegmentStore } from "../stores/segmentStore.ts";
@@ -7,6 +7,10 @@ import { FrameGallery } from "../components/studio/FrameGallery.tsx";
 import { SplatViewer } from "../components/studio/SplatViewer.tsx";
 import { SettingsPanel } from "../components/studio/SettingsPanel.tsx";
 import { EditPanel } from "../components/studio/EditPanel.tsx";
+import { ToastContainer } from "../components/ui/ToastContainer.tsx";
+import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts.ts";
+import { useCollabSync } from "../hooks/useCollabSync.ts";
+import { PresenceIndicator } from "../components/studio/PresenceIndicator.tsx";
 import { Hammer, Pencil } from "lucide-react";
 
 interface AnySplatStudioProps {
@@ -29,6 +33,13 @@ export function AnySplatStudio({ projectId }: AnySplatStudioProps) {
   const [mode, setMode] = useState<StudioMode>(() =>
     currentProject?.status === "ready" ? "edit" : "build"
   );
+
+  const toggleMode = useCallback(() => {
+    setMode((m) => (m === "build" ? "edit" : "build"));
+  }, []);
+
+  useKeyboardShortcuts({ projectId, mode, onToggleMode: toggleMode });
+  useCollabSync(projectId);
 
   // Auto-switch to Edit when rebuild completes (isRunning: true → false, plyUrl exists)
   const wasRunning = useRef(isRunning);
@@ -70,6 +81,7 @@ export function AnySplatStudio({ projectId }: AnySplatStudioProps) {
 
   return (
     <div className="flex-1 flex overflow-hidden">
+      <ToastContainer />
       {/* Left panel — Build mode only */}
       {mode === "build" && (
         <div className="w-[280px] shrink-0 border-r border-gray-800 flex flex-col bg-gray-950">
@@ -82,8 +94,8 @@ export function AnySplatStudio({ projectId }: AnySplatStudioProps) {
       <div className="flex-1 min-w-0 flex flex-col p-2 relative">
         <SplatViewer projectId={projectId} />
 
-        {/* Floating Build/Edit toggle */}
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10">
+        {/* Floating Build/Edit toggle + presence */}
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2">
           <div className="flex bg-gray-900/80 backdrop-blur-sm rounded-lg p-0.5 border border-gray-700/50 shadow-lg">
             <button
               onClick={() => setMode("build")}
@@ -108,6 +120,7 @@ export function AnySplatStudio({ projectId }: AnySplatStudioProps) {
               Edit
             </button>
           </div>
+          <PresenceIndicator />
         </div>
       </div>
 

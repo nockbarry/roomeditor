@@ -123,8 +123,9 @@ class TrainingConfig(BaseModel):
     iterations: int = 15_000
     sh_degree: int = 2
     mode: str = "3dgs"
-    sfm_backend: str = "colmap"  # "colmap", "mast3r", or "anysplat"
+    sfm_backend: str = "colmap"  # "colmap", "mast3r", "anysplat", or "spfsplat"
     mast3r_image_size: int = 512
+    spfsplat_max_views: int = 8
     depth_reg_weight: float = 0.1
     opacity_reg_weight: float = 0.0
     scale_reg_weight: float = 0.0
@@ -156,6 +157,7 @@ class SegmentInfo(BaseModel):
     n_gaussians: int = 0
     click_point: list[int] | None = None
     visible: bool = True
+    semantic_confidence: float | None = None
 
 
 class SegmentManifest(BaseModel):
@@ -193,6 +195,21 @@ class RenameRequest(BaseModel):
 class BatchTransformRequest(BaseModel):
     segment_ids: list[int]
     transform: SegmentTransformRequest
+
+
+class MergeSegmentsRequest(BaseModel):
+    segment_ids: list[int]
+    label: str | None = None
+
+
+class SplitSegmentRequest(BaseModel):
+    n_clusters: int = 2
+
+
+class LightingRequest(BaseModel):
+    brightness: float = 1.0
+    color_tint: list[float] = [1.0, 1.0, 1.0]
+    sh_scale: float = 1.0
 
 
 class GenerateObjectRequest(BaseModel):

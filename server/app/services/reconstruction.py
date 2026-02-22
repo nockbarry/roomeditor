@@ -91,6 +91,48 @@ async def run_reconstruction_pipeline(project_id: str, job_id: str, training_con
         cfg = training_config or {}
         sfm_backend = cfg.get("sfm_backend", "colmap")
 
+        # SPFSplat: pose-free feed-forward (alternative to AnySplat)
+        if sfm_backend == "spfsplat":
+            await update_job_progress(job_id, "running", 0.15, "Running SPFSplat (feed-forward)")
+
+            from pipeline.run_spfsplat_subprocess import run_spfsplat_subprocess
+
+            max_views = cfg.get("spfsplat_max_views", 8)
+
+            def _spfsplat_progress(frac):
+                overall = 0.15 + frac * 0.75
+                asyncio.run_coroutine_threadsafe(
+                    update_job_progress(job_id, "running", overall, "Running SPFSplat"),
+                    loop,
+                )
+
+            def _run_spfsplat():
+                return run_spfsplat_subprocess(
+                    images_dir=frames_dir,
+                    output_ply=ply_path,
+                    max_views=max_views,
+                    progress_callback=_spfsplat_progress,
+                )
+
+            n_gaussians = await loop.run_in_executor(_executor, _run_spfsplat)
+
+            await update_job_progress(job_id, "running", 0.95, "Finalizing")
+
+            for snapshot in project_dir.glob("snapshot_*.ply"):
+                snapshot.unlink()
+
+            async with async_session() as db:
+                result = await db.execute(select(Project).where(Project.id == project_id))
+                project = result.scalar_one_or_none()
+                if project:
+                    project.status = "ready"
+                    project.gaussian_count = n_gaussians
+                    await db.commit()
+
+            await update_job_progress(job_id, "completed", 1.0, "Done")
+            logger.info(f"SPFSplat complete for project {project_id}: {n_gaussians} Gaussians")
+            return
+
         # AnySplat: skip SfM + training entirely
         if sfm_backend == "anysplat":
             await update_job_progress(job_id, "running", 0.15, "Running AnySplat (feed-forward)")
@@ -117,6 +159,14 @@ async def run_reconstruction_pipeline(project_id: str, job_id: str, training_con
                 )
 
             n_gaussians = await loop.run_in_executor(_executor, _run_anysplat)
+
+            # Deduplicate Gaussians if chunked mode was used
+            if use_chunked:
+                await update_job_progress(job_id, "running", 0.92, "Deduplicating chunk overlaps")
+                from pipeline.compress_splat import deduplicate_gaussians
+                dedup_stats = await deduplicate_gaussians(ply_path)
+                n_gaussians = dedup_stats["n_after"]
+                logger.info(f"Chunked dedup: {dedup_stats}")
 
             await update_job_progress(job_id, "running", 0.95, "Finalizing")
 

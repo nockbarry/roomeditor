@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import engine
 from app.models import Base
-from app.routes import anysplat, benchmarks, jobs, objects, postprocess, projects, segments, ws
+from app.routes import anysplat, benchmarks, collab, jobs, objects, postprocess, projects, segments, ws
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +46,7 @@ app.include_router(postprocess.router)
 app.include_router(objects.router)
 app.include_router(jobs.router)
 app.include_router(ws.router)
+app.include_router(collab.router)
 app.include_router(benchmarks.router)
 
 # Serve benchmark data files (renders, etc.) — must be before /data mount

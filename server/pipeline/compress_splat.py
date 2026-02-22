@@ -75,3 +75,85 @@ async def prune_gaussians(
         "n_after": n_keep,
         "n_pruned": n_pruned,
     }
+
+
+async def deduplicate_gaussians(
+    ply_path: Path,
+    distance_threshold: float = 0.005,
+) -> dict:
+    """Remove duplicate Gaussians that appear in chunk overlap regions.
+
+    Uses a KD-tree to find pairs of Gaussians closer than distance_threshold.
+    For each pair, keeps the one with higher opacity and removes the other.
+
+    Args:
+        ply_path: Path to PLY file (modified in place)
+        distance_threshold: Max distance to consider as duplicate (meters)
+
+    Returns:
+        dict with n_before, n_after, n_removed
+    """
+    from plyfile import PlyData, PlyElement
+    from scipy.spatial import cKDTree
+
+    plydata = PlyData.read(str(ply_path))
+    vertex = plydata["vertex"]
+    n_before = len(vertex.data)
+
+    if n_before < 2:
+        return {"n_before": n_before, "n_after": n_before, "n_removed": 0}
+
+    # Extract positions
+    positions = np.column_stack([
+        np.array(vertex["x"]),
+        np.array(vertex["y"]),
+        np.array(vertex["z"]),
+    ])
+
+    # Extract opacities for comparison
+    if "opacity" in vertex.data.dtype.names:
+        opacities = np.array(vertex["opacity"])
+    else:
+        opacities = np.zeros(n_before)
+
+    # Build KD-tree and find close pairs
+    tree = cKDTree(positions)
+    pairs = tree.query_pairs(distance_threshold)
+
+    if not pairs:
+        logger.info(f"Dedup: no duplicates found within {distance_threshold}m")
+        return {"n_before": n_before, "n_after": n_before, "n_removed": 0}
+
+    # For each pair, mark the lower-opacity one for removal
+    to_remove = set()
+    for i, j in pairs:
+        if i in to_remove or j in to_remove:
+            continue
+        # Keep higher opacity, remove lower
+        if opacities[i] >= opacities[j]:
+            to_remove.add(j)
+        else:
+            to_remove.add(i)
+
+    # Build keep mask
+    keep_mask = np.ones(n_before, dtype=bool)
+    for idx in to_remove:
+        keep_mask[idx] = False
+
+    n_removed = len(to_remove)
+    n_after = n_before - n_removed
+
+    if n_removed > 0:
+        filtered_data = vertex.data[keep_mask]
+        el = PlyElement.describe(filtered_data, "vertex")
+        PlyData([el]).write(str(ply_path))
+
+    logger.info(
+        f"Dedup: removed {n_removed:,} duplicates ({n_before:,} -> {n_after:,}), "
+        f"threshold={distance_threshold}m"
+    )
+    return {
+        "n_before": n_before,
+        "n_after": n_after,
+        "n_removed": n_removed,
+    }
