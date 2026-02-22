@@ -25,6 +25,31 @@ export interface RefineResult {
   n_gaussians: number;
   iterations_run: number;
   ply_url: string;
+  pre_stats: Record<string, number> | null;
+  post_stats: Record<string, number> | null;
+}
+
+export interface RefinePresetInfo {
+  label: string;
+  description: string;
+  iterations: number;
+}
+
+export interface RefineMetrics {
+  step: number;
+  total_steps: number;
+  losses: { total: number; l1: number; ssim: number; depth_tv: number };
+  lr: { means: number };
+  n_gaussians: number;
+  active_sh_degree: number;
+}
+
+export interface RefineEval {
+  step: number;
+  total_steps: number;
+  mean_psnr: number;
+  mean_ssim: number;
+  per_view: Array<{ index: number; psnr: number; ssim: number }>;
 }
 
 export async function pruneSplat(
@@ -43,12 +68,32 @@ export async function getQualityStats(
   return api.get<QualityStats>(`/projects/${projectId}/quality-stats`);
 }
 
+export interface ComparisonPair {
+  label: string;
+  before_url: string;
+  after_url: string;
+}
+
+export async function getComparisonInfo(
+  projectId: string
+): Promise<{ pairs: ComparisonPair[] }> {
+  return api.get(`/projects/${projectId}/comparison-info`);
+}
+
 export async function refineSplat(
   projectId: string,
-  params?: { iterations?: number; mode?: string }
+  params?: { preset?: string; mode?: string }
 ): Promise<RefineResult> {
   return api.post<RefineResult>(`/projects/${projectId}/refine`, {
-    iterations: params?.iterations ?? 2000,
+    preset: params?.preset ?? "balanced",
     mode: params?.mode ?? "3dgs",
   });
+}
+
+export async function stopRefinement(projectId: string): Promise<void> {
+  await api.post(`/projects/${projectId}/refine/stop`, {});
+}
+
+export async function getRefinePresets(): Promise<Record<string, RefinePresetInfo>> {
+  return api.get(`/projects/config/refine-presets`);
 }

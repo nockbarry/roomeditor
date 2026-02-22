@@ -1,8 +1,9 @@
 import { create } from "zustand";
 import type { FrameInfo, AnySplatRunResult } from "../types/api.ts";
 import * as anysplatApi from "../api/anysplat.ts";
-import type { QualityStats, PruneResult, RefineResult } from "../api/postprocess.ts";
+import type { QualityStats, PruneResult, RefineResult, ComparisonPair, RefineMetrics, RefineEval } from "../api/postprocess.ts";
 import * as postprocessApi from "../api/postprocess.ts";
+import { toast } from "./toastStore.ts";
 
 interface AnySplatStore {
   frames: FrameInfo[];
@@ -21,12 +22,22 @@ interface AnySplatStore {
   refineStep: number;
   refineTotal: number;
   refineLoss: number | null;
+  refineLossHistory: number[];
+  refineGaussianCount: number | null;
+  refineStartTime: number | null;
+  refineMetricsHistory: RefineMetrics[];
+  refineEvalHistory: RefineEval[];
+  refineBaseline: { psnr: number; ssim: number } | null;
+  refinePreset: string;
   lastRun: AnySplatRunResult | null;
   qualityStats: QualityStats | null;
   pruneResult: PruneResult | null;
   refineResult: RefineResult | null;
   plyUrl: string | null;
   plyVersion: number;
+  comparisonPairs: ComparisonPair[];
+  showComparison: boolean;
+  comparisonBeforeUrl: string | null;
 
   // Actions
   extractFrames: (projectId: string, fps?: number) => Promise<void>;
@@ -41,8 +52,15 @@ interface AnySplatStore {
   setFps: (fps: number) => void;
   runAnySplat: (projectId: string) => Promise<void>;
   pruneSplat: (projectId: string) => Promise<void>;
-  refineSplat: (projectId: string, iterations?: number) => Promise<void>;
+  refineSplat: (projectId: string, params?: {
+    preset?: string; mode?: string;
+  }) => Promise<void>;
+  stopRefinement: (projectId: string) => Promise<void>;
+  setRefinePreset: (preset: string) => void;
   fetchQualityStats: (projectId: string) => Promise<void>;
+  fetchComparisonInfo: (projectId: string) => Promise<void>;
+  setShowComparison: (show: boolean) => void;
+  setComparisonBeforeUrl: (url: string | null) => void;
   reset: () => void;
 }
 
@@ -88,12 +106,22 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
   refineStep: 0,
   refineTotal: 0,
   refineLoss: null,
+  refineLossHistory: [],
+  refineGaussianCount: null,
+  refineStartTime: null,
+  refineMetricsHistory: [],
+  refineEvalHistory: [],
+  refineBaseline: null,
+  refinePreset: "balanced",
   lastRun: null,
   qualityStats: null,
   pruneResult: null,
   refineResult: null,
   plyUrl: null,
   plyVersion: 0,
+  comparisonPairs: [],
+  showComparison: false,
+  comparisonBeforeUrl: null,
 
   extractFrames: async (projectId: string, fps?: number) => {
     const fpsToUse = fps ?? get().fps;
@@ -106,9 +134,11 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
         framesLoading: false,
         isExtracting: false,
       });
+      toast.success(`Extracted ${manifest.frames.length} frames`);
     } catch (e) {
       console.error("Failed to extract frames:", e);
       set({ framesLoading: false, isExtracting: false });
+      toast.error("Failed to extract frames");
     }
   },
 
@@ -192,9 +222,11 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
       }));
       // Auto-fetch quality stats after rebuild
       get().fetchQualityStats(projectId);
+      toast.success(`Reconstruction complete — ${result.n_gaussians.toLocaleString()} gaussians`);
     } catch (e) {
       console.error("Failed to run AnySplat:", e);
       set({ isRunning: false });
+      toast.error(`Reconstruction failed: ${e instanceof Error ? e.message : "Unknown error"}`);
     }
   },
 
@@ -208,16 +240,27 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
         plyVersion: s.plyVersion + 1,
       }));
       get().fetchQualityStats(projectId);
+      get().fetchComparisonInfo(projectId);
+      toast.success(`Pruned ${result.n_pruned.toLocaleString()} floaters`);
     } catch (e) {
       console.error("Failed to prune:", e);
       set({ isPruning: false });
+      toast.error("Failed to prune splat");
     }
   },
 
-  refineSplat: async (projectId: string, iterations?: number) => {
-    set({ isRefining: true, refineStep: 0, refineTotal: iterations ?? 2000, refineLoss: null });
+  refineSplat: async (projectId: string, params?: {
+    preset?: string; mode?: string;
+  }) => {
+    const preset = params?.preset ?? get().refinePreset;
+    set({
+      isRefining: true, refineStep: 0, refineTotal: 0,
+      refineLoss: null, refineLossHistory: [], refineGaussianCount: null,
+      refineStartTime: Date.now(),
+      refineMetricsHistory: [], refineEvalHistory: [], refineBaseline: null,
+    });
 
-    // Open WebSocket to receive streaming snapshots during refinement
+    // Open WebSocket to receive streaming updates during refinement
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${wsProtocol}//${window.location.host}/ws/stream/${projectId}`;
     let ws: WebSocket | null = null;
@@ -231,38 +274,68 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
               refineStep: data.step,
               refineTotal: data.total_steps,
               refineLoss: data.loss,
+              refineGaussianCount: data.n_gaussians,
+              refineLossHistory: [...s.refineLossHistory, data.loss],
               plyVersion: s.plyVersion + 1,
             }));
           } else if (data.type === "refine_progress") {
-            set({ refineStep: Math.round(data.progress * (get().refineTotal || 2000)) });
+            set((s) => ({ refineStep: Math.round(data.progress * (s.refineTotal || 1)) }));
+          } else if (data.type === "refine_metrics") {
+            set((s) => ({
+              refineStep: data.step,
+              refineTotal: data.total_steps,
+              refineLoss: data.losses.total,
+              refineGaussianCount: data.n_gaussians,
+              refineMetricsHistory: [...s.refineMetricsHistory, data as import("../api/postprocess.ts").RefineMetrics],
+            }));
+          } else if (data.type === "refine_eval") {
+            const evalData = data as import("../api/postprocess.ts").RefineEval;
+            set((s) => {
+              const baseline = s.refineBaseline ?? { psnr: evalData.mean_psnr, ssim: evalData.mean_ssim };
+              return {
+                refineBaseline: s.refineBaseline ?? baseline,
+                refineEvalHistory: [...s.refineEvalHistory, evalData],
+              };
+            });
           }
         } catch { /* ignore parse errors */ }
       };
     } catch {
-      // WS connection failed — refinement still works, just no streaming
       ws = null;
     }
 
     try {
-      const result = await postprocessApi.refineSplat(projectId, { iterations });
+      const result = await postprocessApi.refineSplat(projectId, { preset, mode: params?.mode });
       set((s) => ({
         isRefining: false,
         refineResult: result,
-        refineStep: 0,
-        refineTotal: 0,
-        refineLoss: null,
         plyVersion: s.plyVersion + 1,
       }));
       get().fetchQualityStats(projectId);
+      get().fetchComparisonInfo(projectId);
+      toast.success("Refinement complete");
     } catch (e) {
       console.error("Failed to refine:", e);
-      set({ isRefining: false, refineStep: 0, refineTotal: 0, refineLoss: null });
+      set({ isRefining: false });
+      toast.error(`Refinement failed: ${e instanceof Error ? e.message : "Unknown error"}`);
     } finally {
       if (ws && ws.readyState <= WebSocket.OPEN) {
         ws.close();
       }
     }
   },
+
+  stopRefinement: async (projectId: string) => {
+    try {
+      await postprocessApi.stopRefinement(projectId);
+      toast.success("Stop requested — finishing current step...");
+    } catch (e) {
+      console.error("Failed to stop refinement:", e);
+      toast.error("Failed to stop refinement");
+    }
+  },
+
+  setRefinePreset: (preset: string) => set({ refinePreset: preset }),
 
   fetchQualityStats: async (projectId: string) => {
     try {
@@ -272,6 +345,18 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
       console.error("Failed to fetch quality stats:", e);
     }
   },
+
+  fetchComparisonInfo: async (projectId) => {
+    try {
+      const data = await postprocessApi.getComparisonInfo(projectId);
+      set({ comparisonPairs: data.pairs });
+    } catch {
+      set({ comparisonPairs: [] });
+    }
+  },
+
+  setShowComparison: (show) => set({ showComparison: show }),
+  setComparisonBeforeUrl: (url) => set({ comparisonBeforeUrl: url }),
 
   reset: () => {
     set({
@@ -291,12 +376,22 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
       refineStep: 0,
       refineTotal: 0,
       refineLoss: null,
+      refineLossHistory: [],
+      refineGaussianCount: null,
+      refineStartTime: null,
+      refineMetricsHistory: [],
+      refineEvalHistory: [],
+      refineBaseline: null,
+      refinePreset: "balanced",
       lastRun: null,
       qualityStats: null,
       pruneResult: null,
       refineResult: null,
       plyUrl: null,
       plyVersion: 0,
+      comparisonPairs: [],
+      showComparison: false,
+      comparisonBeforeUrl: null,
     });
   },
 }));

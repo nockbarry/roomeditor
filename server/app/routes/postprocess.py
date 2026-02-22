@@ -1,5 +1,6 @@
 """Post-processing endpoints — prune, refine, quality stats."""
 
+import base64
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,79 @@ from app.models import Project
 
 logger = logging.getLogger(__name__)
 _refine_executor = ThreadPoolExecutor(max_workers=1)
+
+# Track active trainers for stop support
+_active_trainers: dict[str, object] = {}
+
+# --- Refinement Presets ---
+
+REFINE_PRESETS = {
+    "conservative": {
+        "label": "Conservative",
+        "description": "Appearance-only refinement. Positions frozen, no densification. Safest option.",
+        "config": {
+            "iterations": 1000,
+            "sh_degree": 1,
+            "means_lr": 1.6e-4,
+            "means_lr_final": 1.6e-6,
+            "scales_lr": 5e-4,
+            "quats_lr": 1e-4,
+            "opacities_lr": 5e-3,
+            "sh0_lr": 1e-3,
+            "shN_lr": 1e-3,
+            "freeze_positions_pct": 1.0,
+            "densify_enabled": False,
+            "reset_opacity": False,
+            "depth_reg_weight": 0.05,
+            "opacity_reg_weight": 0.01,
+            "scale_reg_weight": 0.01,
+        },
+    },
+    "balanced": {
+        "label": "Balanced",
+        "description": "Moderate refinement with conservative densification. Recommended default.",
+        "config": {
+            "iterations": 2000,
+            "sh_degree": 1,
+            "means_lr": 1.6e-5,
+            "means_lr_final": 1.6e-7,
+            "scales_lr": 1e-3,
+            "quats_lr": 2e-4,
+            "opacities_lr": 1e-2,
+            "sh0_lr": 5e-4,
+            "shN_lr": 5e-4,
+            "freeze_positions_pct": 0.1,
+            "densify_enabled": True,
+            "reset_opacity": False,
+            "grow_grad2d": 0.0005,
+            "depth_reg_weight": 0.05,
+            "opacity_reg_weight": 0.01,
+            "scale_reg_weight": 0.01,
+        },
+    },
+    "aggressive": {
+        "label": "Aggressive",
+        "description": "Full retrain with higher learning rates and full densification.",
+        "config": {
+            "iterations": 5000,
+            "sh_degree": 2,
+            "means_lr": 8e-5,
+            "means_lr_final": 8e-7,
+            "scales_lr": 3e-3,
+            "quats_lr": 5e-4,
+            "opacities_lr": 3e-2,
+            "sh0_lr": 1.5e-3,
+            "shN_lr": 1.5e-3,
+            "freeze_positions_pct": 0.05,
+            "densify_enabled": True,
+            "reset_opacity": False,
+            "grow_grad2d": 0.0003,
+            "depth_reg_weight": 0.05,
+            "opacity_reg_weight": 0.01,
+            "scale_reg_weight": 0.01,
+        },
+    },
+}
 
 router = APIRouter(prefix="/api/projects", tags=["postprocess"])
 
@@ -53,6 +127,12 @@ async def prune_splat(
     if not ply_path.exists():
         raise HTTPException(status_code=400, detail="No scene.ply found")
 
+    # Save before-prune backup for comparison
+    import shutil
+    backup_path = ply_path.parent / "scene_pre_prune.ply"
+    if not backup_path.exists():
+        shutil.copy2(str(ply_path), str(backup_path))
+
     from pipeline.compress_splat import prune_gaussians
 
     stats = await prune_gaussians(
@@ -66,6 +146,42 @@ async def prune_splat(
     await db.commit()
 
     return PruneResult(**stats)
+
+
+# --- Comparison Info ---
+
+
+@router.get("/{project_id}/comparison-info")
+async def get_comparison_info(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return available before/after PLY pairs for comparison."""
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = settings.data_dir / "projects" / project_id
+    pairs = []
+
+    pre_prune = project_dir / "scene_pre_prune.ply"
+    if pre_prune.exists():
+        pairs.append({
+            "label": "Pre-Prune",
+            "before_url": f"/data/{project_id}/scene_pre_prune.ply",
+            "after_url": f"/data/{project_id}/scene.ply",
+        })
+
+    pre_refine = project_dir / "scene_pre_refine.ply"
+    if pre_refine.exists():
+        pairs.append({
+            "label": "Pre-Refine",
+            "before_url": f"/data/{project_id}/scene_pre_refine.ply",
+            "after_url": f"/data/{project_id}/scene.ply",
+        })
+
+    return {"pairs": pairs}
 
 
 # --- Quality Stats ---
@@ -123,7 +239,7 @@ async def get_quality_stats(
 
 
 class RefineRequest(BaseModel):
-    iterations: int = 2000
+    preset: str = "balanced"  # "conservative", "balanced", or "aggressive"
     mode: str = "3dgs"  # "3dgs" or "2dgs"
 
 
@@ -132,11 +248,40 @@ class RefineResult(BaseModel):
     n_gaussians: int
     iterations_run: int
     ply_url: str
+    pre_stats: dict | None = None
+    post_stats: dict | None = None
+
+
+@router.get("/config/refine-presets")
+async def get_refine_presets():
+    """Return available refinement preset definitions."""
+    return {
+        name: {"label": p["label"], "description": p["description"], "iterations": p["config"]["iterations"]}
+        for name, p in REFINE_PRESETS.items()
+    }
+
+
+def _split_train_test(n_views: int, test_every: int = 4) -> tuple[list[int], list[int]]:
+    """Split view indices into train and test sets."""
+    train = []
+    test = []
+    for i in range(n_views):
+        if i % test_every == 0 and n_views > test_every:
+            test.append(i)
+        else:
+            train.append(i)
+    # Ensure at least 2 train views
+    if len(train) < 2:
+        train = list(range(n_views))
+        test = []
+    return train, test
 
 
 def _run_refine(
-    project_dir: Path, frames_dir: Path, iterations: int, mode: str,
-    on_snapshot=None, on_progress=None,
+    project_id: str,
+    project_dir: Path, frames_dir: Path, preset: str = "balanced",
+    mode: str = "3dgs",
+    on_snapshot=None, on_progress=None, on_metrics=None, on_evaluation=None,
 ) -> dict:
     """Run training refinement in a thread (blocking, GPU-bound)."""
     import torch
@@ -148,6 +293,10 @@ def _run_refine(
 
     if not cameras_path.exists():
         raise RuntimeError("No cameras.json found — rebuild with AnySplat first")
+
+    # Resolve preset config
+    preset_def = REFINE_PRESETS.get(preset, REFINE_PRESETS["balanced"])
+    preset_config = preset_def["config"]
 
     # Load camera data from AnySplat's cameras.json
     with open(cameras_path) as f:
@@ -195,81 +344,167 @@ def _run_refine(
     if len(cameras_data) < 2:
         raise RuntimeError(f"Only {len(cameras_data)} valid camera views found, need at least 2")
 
-    # Load existing PLY as initialization
+    # Load existing PLY — extract ALL parameters in their native space
     plydata = PlyData.read(str(ply_path))
     vertex = plydata["vertex"]
     n_pts = len(vertex.data)
+    field_names = vertex.data.dtype.names
 
     means = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=-1).astype(np.float32)
 
-    # Extract DC color from SH
-    if "f_dc_0" in vertex.data.dtype.names:
-        C0 = 0.28209479177387814
-        r = np.array(vertex["f_dc_0"]) * C0 + 0.5
-        g = np.array(vertex["f_dc_1"]) * C0 + 0.5
-        b = np.array(vertex["f_dc_2"]) * C0 + 0.5
-        colors = np.stack([r, g, b], axis=-1).clip(0, 1).astype(np.float32)
-    else:
-        colors = np.ones((n_pts, 3), dtype=np.float32) * 0.5
+    # Extract scales (log-space), rotations, opacities (logit-space), SH0
+    has_full_params = all(
+        f in field_names for f in ("scale_0", "rot_0", "opacity", "f_dc_0")
+    )
 
-    logger.info(f"Refining {n_pts:,} gaussians with {len(cameras_data)} views for {iterations} iterations")
+    if has_full_params:
+        scales = np.stack(
+            [vertex["scale_0"], vertex["scale_1"], vertex["scale_2"]], axis=-1
+        ).astype(np.float32)
+        quats = np.stack(
+            [vertex["rot_0"], vertex["rot_1"], vertex["rot_2"], vertex["rot_3"]],
+            axis=-1,
+        ).astype(np.float32)
+        opacities = np.array(vertex["opacity"]).astype(np.float32)
+        sh0 = np.stack(
+            [vertex["f_dc_0"], vertex["f_dc_1"], vertex["f_dc_2"]], axis=-1
+        ).astype(np.float32)
+    else:
+        # Fallback: only positions and colors available
+        scales = None
+        quats = None
+        opacities = None
+        sh0 = None
+
+    from pipeline.evaluate_noreference import compute_gaussian_stats
+
+    pre_stats_obj = compute_gaussian_stats(ply_path)
+    pre_stats = vars(pre_stats_obj) if hasattr(pre_stats_obj, '__dict__') else dict(pre_stats_obj)
+
+    iterations = preset_config["iterations"]
+    logger.info(f"Refining {n_pts:,} gaussians with {len(cameras_data)} views for {iterations} iterations (preset={preset})")
 
     # Use the trainer
     from pipeline.train_gaussians import GaussianTrainer, TrainerConfig, TrainerCallbacks
 
     config = TrainerConfig(
         iterations=iterations,
-        sh_degree=0,  # Start with DC only for fast refinement
+        sh_degree=preset_config.get("sh_degree", 1),
         mode=mode,
-        depth_reg_weight=0.05,
-        opacity_reg_weight=0.01,
-        scale_reg_weight=0.01,
+        depth_reg_weight=preset_config.get("depth_reg_weight", 0.05),
+        opacity_reg_weight=preset_config.get("opacity_reg_weight", 0.01),
+        scale_reg_weight=preset_config.get("scale_reg_weight", 0.01),
         prune_opa=0.005,
         densify_until_pct=0.5,
+        means_lr=preset_config.get("means_lr", 1.6e-4),
+        means_lr_final=preset_config.get("means_lr_final", 1.6e-6),
+        scales_lr=preset_config.get("scales_lr", 5e-3),
+        quats_lr=preset_config.get("quats_lr", 1e-3),
+        opacities_lr=preset_config.get("opacities_lr", 5e-2),
+        sh0_lr=preset_config.get("sh0_lr", 2.5e-3),
+        shN_lr=preset_config.get("shN_lr", 2.5e-3),
+        densify_enabled=preset_config.get("densify_enabled", True),
+        reset_opacity=preset_config.get("reset_opacity", True),
+        freeze_positions_pct=preset_config.get("freeze_positions_pct", 0.0),
+        grow_grad2d=preset_config.get("grow_grad2d", 0.0002),
     )
 
     trainer = GaussianTrainer(config)
-    trainer.cameras_data = cameras_data
 
-    # Load images
+    # Store all cameras/images for evaluation before splitting
+    all_cameras = list(cameras_data)
+
+    # Load all images
     from PIL import Image as PILImage
-    trainer.gt_images = []
-    for cam in cameras_data:
+    all_images = []
+    for cam in all_cameras:
         img = PILImage.open(cam["image_path"]).convert("RGB")
         if img.size != (cam["width"], cam["height"]):
             img = img.resize((cam["width"], cam["height"]), PILImage.LANCZOS)
         arr = np.array(img, dtype=np.float32) / 255.0
-        trainer.gt_images.append(
+        all_images.append(
             torch.tensor(arr, dtype=torch.float32, device="cuda")
         )
 
-    # Initialize from existing PLY points
-    trainer.init_params(means, colors)
+    # Train/test split
+    train_indices, test_indices = _split_train_test(len(all_cameras), test_every=4)
+    logger.info(f"Train/test split: {len(train_indices)} train, {len(test_indices)} test views")
+
+    # Set up trainer with all data first
+    trainer.cameras_data = all_cameras
+    trainer.gt_images = all_images
+
+    # Store references for evaluation during training
+    trainer._all_cameras = all_cameras
+    trainer._all_images = all_images
+    trainer._eval_views = test_indices
+
+    # Compute baseline metrics before training
+    baseline = None
+    if has_full_params:
+        # Initialize from existing PLY with full parameters
+        trainer.init_params_from_existing(means, scales, quats, opacities, sh0)
+    else:
+        # Fallback: extract colors and use sparse init
+        C0 = 0.28209479177387814
+        if "f_dc_0" in field_names:
+            r = np.array(vertex["f_dc_0"]) * C0 + 0.5
+            g = np.array(vertex["f_dc_1"]) * C0 + 0.5
+            b = np.array(vertex["f_dc_2"]) * C0 + 0.5
+            colors = np.stack([r, g, b], axis=-1).clip(0, 1).astype(np.float32)
+        else:
+            colors = np.ones((n_pts, 3), dtype=np.float32) * 0.5
+        trainer.init_params(means, colors)
+
     trainer.init_strategy()
+
+    # Compute baseline evaluation
+    if test_indices:
+        baseline = trainer.evaluate_views(test_indices, all_cameras, all_images)
+        logger.info(f"Baseline: PSNR={baseline['mean_psnr']:.2f} dB, SSIM={baseline['mean_ssim']:.4f}")
+
+    # Restrict training to train views only
+    trainer.set_training_views(train_indices)
+
+    # Register active trainer for stop support
+    _active_trainers[project_id] = trainer
 
     output_path = project_dir / "refined.ply"
     callbacks = TrainerCallbacks(
         snapshot=on_snapshot,
         progress=on_progress,
+        metrics=on_metrics,
+        evaluation=on_evaluation,
         snapshot_every=500,
+        metrics_every=50,
+        eval_every=500,
     )
-    n_final = trainer.train(callbacks, output_path)
 
-    # Export and replace scene.ply
-    trainer.export(output_path)
+    try:
+        n_final = trainer.train(callbacks, output_path)
 
-    import shutil
-    # Backup original
-    backup = project_dir / "scene_pre_refine.ply"
-    if not backup.exists():
-        shutil.copy2(str(ply_path), str(backup))
-    shutil.copy2(str(output_path), str(ply_path))
+        # Export and replace scene.ply
+        trainer.export(output_path)
 
-    trainer.cleanup()
+        import shutil
+        # Backup original
+        backup = project_dir / "scene_pre_refine.ply"
+        if not backup.exists():
+            shutil.copy2(str(ply_path), str(backup))
+        shutil.copy2(str(output_path), str(ply_path))
+    finally:
+        _active_trainers.pop(project_id, None)
+        trainer.cleanup()
+
+    post_stats_obj = compute_gaussian_stats(ply_path)
+    post_stats = vars(post_stats_obj) if hasattr(post_stats_obj, '__dict__') else dict(post_stats_obj)
 
     return {
         "n_gaussians": n_final,
         "iterations_run": iterations,
+        "pre_stats": pre_stats,
+        "post_stats": post_stats,
+        "baseline": baseline,
     }
 
 
@@ -294,6 +529,9 @@ async def refine_splat(
 
     if not ply_path.exists():
         raise HTTPException(status_code=400, detail="No scene.ply found — rebuild first")
+
+    if project_id in _active_trainers:
+        raise HTTPException(status_code=409, detail="Refinement already in progress")
 
     import asyncio
     from app.routes.ws import broadcast_stream_update
@@ -322,24 +560,63 @@ async def refine_splat(
             loop,
         )
 
+    def on_metrics(metrics_dict):
+        asyncio.run_coroutine_threadsafe(
+            broadcast_stream_update(project_id, {
+                "type": "refine_metrics",
+                **metrics_dict,
+            }),
+            loop,
+        )
+
+    def on_evaluation(eval_dict):
+        asyncio.run_coroutine_threadsafe(
+            broadcast_stream_update(project_id, {
+                "type": "refine_eval",
+                **eval_dict,
+            }),
+            loop,
+        )
+
     try:
         result_data = await loop.run_in_executor(
             _refine_executor,
             lambda: _run_refine(
-                project_dir, frames_dir, body.iterations, body.mode,
+                project_id,
+                project_dir, frames_dir,
+                preset=body.preset, mode=body.mode,
                 on_snapshot=on_snapshot, on_progress=on_progress,
+                on_metrics=on_metrics, on_evaluation=on_evaluation,
             ),
         )
     except Exception as e:
+        _active_trainers.pop(project_id, None)
         logger.error(f"Refine failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     project.gaussian_count = result_data["n_gaussians"]
     await db.commit()
 
+    # Send baseline info in the final result
+    baseline = result_data.get("baseline")
+
     return RefineResult(
         status="refined",
         n_gaussians=result_data["n_gaussians"],
         iterations_run=result_data["iterations_run"],
         ply_url=f"/data/{project_id}/scene.ply",
+        pre_stats=result_data.get("pre_stats"),
+        post_stats=result_data.get("post_stats"),
     )
+
+
+@router.post("/{project_id}/refine/stop")
+async def stop_refinement(
+    project_id: str,
+):
+    """Request the active refinement to stop early."""
+    trainer = _active_trainers.get(project_id)
+    if trainer is None:
+        raise HTTPException(status_code=404, detail="No active refinement for this project")
+    trainer.request_stop()
+    return {"status": "stop_requested"}

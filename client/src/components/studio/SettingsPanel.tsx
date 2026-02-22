@@ -1,4 +1,5 @@
 import { useAnySplatStore } from "../../stores/anysplatStore.ts";
+import { usePresetStore } from "../../stores/presetStore.ts";
 import {
   Play,
   Loader2,
@@ -13,6 +14,8 @@ import {
   BarChart3,
   Zap,
   SlidersHorizontal,
+  Save,
+  Trash2,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -108,6 +111,12 @@ export function SettingsPanel({ projectId }: SettingsPanelProps) {
   const plyUrl = useAnySplatStore((s) => s.plyUrl);
 
   const [showCustomize, setShowCustomize] = useState(false);
+  const [presetName, setPresetName] = useState("");
+  const [showSavePreset, setShowSavePreset] = useState(false);
+  const userPresets = usePresetStore((s) => s.userPresets);
+  const savePreset = usePresetStore((s) => s.savePreset);
+  const deletePreset = usePresetStore((s) => s.deletePreset);
+  const applyPreset = usePresetStore((s) => s.applyPreset);
 
   const qualityLevel = getQualityLevel(maxViews, chunked);
   const activeLevel = QUALITY_LEVELS.find((q) => q.level === qualityLevel);
@@ -324,6 +333,69 @@ export function SettingsPanel({ projectId }: SettingsPanelProps) {
         )}
       </div>
 
+      {/* Saved Presets */}
+      {(userPresets.length > 0 || showCustomize) && (
+        <div className="px-3 py-2 border-b border-gray-800">
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-[10px] uppercase tracking-wider text-gray-500">My Presets</span>
+            <button
+              onClick={() => setShowSavePreset(!showSavePreset)}
+              className="text-[10px] text-gray-500 hover:text-emerald-400 flex items-center gap-0.5"
+            >
+              <Save className="w-3 h-3" /> Save
+            </button>
+          </div>
+          {showSavePreset && (
+            <div className="flex gap-1 mb-1.5">
+              <input
+                value={presetName}
+                onChange={(e) => setPresetName(e.target.value)}
+                placeholder="Preset name..."
+                className="flex-1 bg-gray-900 border border-gray-800 rounded px-2 py-1 text-xs text-gray-300 focus:outline-none focus:border-emerald-500"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && presetName.trim()) {
+                    savePreset(presetName.trim());
+                    setPresetName("");
+                    setShowSavePreset(false);
+                  }
+                }}
+              />
+              <button
+                onClick={() => {
+                  if (presetName.trim()) {
+                    savePreset(presetName.trim());
+                    setPresetName("");
+                    setShowSavePreset(false);
+                  }
+                }}
+                className="bg-emerald-600 hover:bg-emerald-500 px-2 py-1 rounded text-xs"
+              >
+                Save
+              </button>
+            </div>
+          )}
+          {userPresets.map((p) => (
+            <div key={p.id} className="flex items-center gap-1 py-0.5">
+              <button
+                onClick={() => applyPreset(p.id)}
+                className="flex-1 text-left text-xs text-gray-400 hover:text-white truncate"
+              >
+                {p.name}
+              </button>
+              <span className="text-[9px] text-gray-600 shrink-0">
+                {p.chunked ? "chunked" : `${p.maxViews}v`}
+              </span>
+              <button
+                onClick={() => deletePreset(p.id)}
+                className="text-gray-700 hover:text-red-400 p-0.5"
+              >
+                <Trash2 className="w-2.5 h-2.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Rebuild button */}
       <div className="px-3 py-3 border-b border-gray-800">
         <button
@@ -360,7 +432,7 @@ export function SettingsPanel({ projectId }: SettingsPanelProps) {
             )}
           </button>
           <button
-            onClick={() => refineSplat(projectId, 2000)}
+            onClick={() => refineSplat(projectId, { preset: "balanced" })}
             disabled={anyProcessing}
             className="w-full bg-blue-900/40 hover:bg-blue-900/60 disabled:opacity-50 px-3 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 text-blue-300"
           >
