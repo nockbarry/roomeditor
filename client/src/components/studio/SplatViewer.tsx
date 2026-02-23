@@ -20,7 +20,7 @@ function formatGaussianCount(n: number): string {
 
 export function SplatViewer({ projectId }: SplatViewerProps) {
   const {
-    containerRef, loading, error, numSplats, loadPly,
+    containerRef, loading, error, numSplats, loadPly, loadScene,
     splatMeshRef, positionsRef, sceneRef, cameraRef,
     onPickRef, onHoverRef, onGizmoDragEndRef, updateGizmo,
   } = useSplatScene();
@@ -193,8 +193,18 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
 
   useEffect(() => {
     if (!plyUrl) return;
-    loadPly(`${plyUrl}?t=${Date.now()}`);
-  }, [plyUrl, plyVersion, loadPly]);
+    const t = Date.now();
+    // Try SPZ first, fall back to PLY via loadScene
+    const spzUrl = plyUrl.replace(/\.ply$/, ".spz");
+    const posUrl = plyUrl.replace(/\.ply$/, ".positions.bin");
+    if (spzUrl !== plyUrl) {
+      // Normal scene.ply URL — try SPZ with PLY fallback
+      loadScene(`${spzUrl}?t=${t}`, `${posUrl}?t=${t}`, `${plyUrl}?t=${t}`);
+    } else {
+      // Non-standard PLY URL (comparison snapshots etc.) — load directly
+      loadPly(`${plyUrl}?t=${t}`);
+    }
+  }, [plyUrl, plyVersion, loadPly, loadScene]);
 
   return (
     <div className={`flex-1 min-h-0 relative rounded-lg overflow-hidden bg-gray-900 border border-gray-800 ${hoveredSegmentId !== null ? "cursor-pointer" : ""}`}>

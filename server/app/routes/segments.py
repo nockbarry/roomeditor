@@ -108,6 +108,13 @@ def _write_ply_safe(plydata, ply_path: Path):
         raise
 
 
+def _write_ply_and_regenerate_spz(plydata, ply_path: Path):
+    """Write PLY safely and regenerate SPZ + positions sidecar."""
+    _write_ply_safe(plydata, ply_path)
+    from utils.spz_convert import generate_spz_bundle
+    generate_spz_bundle(ply_path.parent)
+
+
 # ---------------------------------------------------------------------------
 # SAM2 Segmentation
 # ---------------------------------------------------------------------------
@@ -502,7 +509,7 @@ def _apply_transform(ply_path: Path, gaussian_ids: list[int], transform: Segment
     vertices["y"] = y.astype(np.float32)
     vertices["z"] = z.astype(np.float32)
 
-    _write_ply_safe(plydata, ply_path)
+    _write_ply_and_regenerate_spz(plydata, ply_path)
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +567,7 @@ def _delete_gaussians(ply_path: Path, gaussian_ids: list[int]):
         opacities[ids] = -100.0
         vertices["opacity"] = opacities
 
-    _write_ply_safe(plydata, ply_path)
+    _write_ply_and_regenerate_spz(plydata, ply_path)
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +590,9 @@ async def undo(
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    from utils.spz_convert import generate_spz_bundle
+    generate_spz_bundle(project_dir)
+
     return {"status": "ok", **info}
 
 
@@ -603,6 +613,9 @@ async def restore_original(
         raise HTTPException(status_code=400, detail="No original AnySplat output found")
 
     shutil.copy2(str(original_ply), str(scene_ply))
+
+    from utils.spz_convert import generate_spz_bundle
+    generate_spz_bundle(project_dir)
 
     # Clear segment manifest
     if manifest_path.exists():
@@ -708,7 +721,7 @@ def _toggle_visibility(ply_path: Path, segment: dict, visible: bool):
             segment.pop("saved_opacities", None)
 
     vertices["opacity"] = opacities
-    _write_ply_safe(plydata, ply_path)
+    _write_ply_and_regenerate_spz(plydata, ply_path)
 
 
 # ---------------------------------------------------------------------------
@@ -784,7 +797,7 @@ def _duplicate_gaussians(ply_path: Path, manifest: dict, segment: dict, offset: 
     # Merge old + new
     merged = np.concatenate([vertices.data, cloned_data])
     new_element = PlyElement.describe(merged, "vertex")
-    _write_ply_safe(PlyData([new_element], text=False), ply_path)
+    _write_ply_and_regenerate_spz(PlyData([new_element], text=False), ply_path)
 
     # Create new segment in manifest
     new_ids = list(range(old_count, old_count + len(ids)))
@@ -1326,7 +1339,7 @@ def _adjust_lighting(ply_path: Path, gaussian_ids: list[int], params: LightingRe
                 vals[ids] *= params.sh_scale
                 vertices[attr] = vals.astype(np.float32)
 
-    _write_ply_safe(plydata, ply_path)
+    _write_ply_and_regenerate_spz(plydata, ply_path)
 
 
 # ---------------------------------------------------------------------------

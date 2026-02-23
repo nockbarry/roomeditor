@@ -1,5 +1,8 @@
 import logging
+import mimetypes
 from contextlib import asynccontextmanager
+
+mimetypes.add_type("application/octet-stream", ".spz")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

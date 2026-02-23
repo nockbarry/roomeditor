@@ -141,6 +141,10 @@ async def prune_splat(
         max_gaussians=body.max_gaussians,
     )
 
+    # Regenerate SPZ + positions sidecar
+    from utils.spz_convert import generate_spz_bundle
+    generate_spz_bundle(ply_path.parent)
+
     # Update gaussian count in DB
     project.gaussian_count = stats["n_after"]
     await db.commit()
@@ -492,6 +496,10 @@ def _run_refine(
         if not backup.exists():
             shutil.copy2(str(ply_path), str(backup))
         shutil.copy2(str(output_path), str(ply_path))
+
+        # Regenerate SPZ + positions sidecar
+        from utils.spz_convert import generate_spz_bundle
+        generate_spz_bundle(project_dir)
     finally:
         _active_trainers.pop(project_id, None)
         trainer.cleanup()

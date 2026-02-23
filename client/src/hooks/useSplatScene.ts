@@ -150,6 +150,28 @@ function extractPlyPositions(buf: ArrayBuffer): {
   return { positions, nVerts, centroid, radius: Math.sqrt(maxDistSq) };
 }
 
+/**
+ * Parse a positions sidecar binary file (.positions.bin).
+ * Format: uint32 N, float32 cx cy cz, float32 radius, then N*3 float32 positions.
+ */
+function parsePositionsSidecar(buf: ArrayBuffer): {
+  positions: Float32Array;
+  nVerts: number;
+  centroid: THREE.Vector3;
+  radius: number;
+} | null {
+  if (buf.byteLength < 20) return null;
+  const view = new DataView(buf);
+  const nVerts = view.getUint32(0, true);
+  const cx = view.getFloat32(4, true);
+  const cy = view.getFloat32(8, true);
+  const cz = view.getFloat32(12, true);
+  const radius = view.getFloat32(16, true);
+  if (buf.byteLength < 20 + nVerts * 12) return null;
+  const positions = new Float32Array(buf, 20, nVerts * 3);
+  return { positions, nVerts, centroid: new THREE.Vector3(cx, cy, cz), radius };
+}
+
 export interface GizmoDelta {
   translation?: [number, number, number];
   rotation?: [number, number, number];
@@ -162,6 +184,7 @@ export interface SplatSceneHandle {
   error: string | null;
   numSplats: number;
   loadPly: (url: string) => void;
+  loadScene: (sceneUrl: string, positionsUrl: string, plyFallbackUrl?: string) => void;
   splatMeshRef: React.RefObject<SplatMesh | null>;
   positionsRef: React.RefObject<Float32Array | null>;
   sceneRef: React.RefObject<THREE.Scene | null>;
@@ -537,6 +560,127 @@ export function useSplatScene(): SplatSceneHandle {
       });
   }, []);
 
+  /**
+   * Load a scene file (SPZ preferred, PLY fallback) + optional positions sidecar.
+   * If sceneUrl 404s, falls back to plyFallbackUrl (if provided).
+   */
+  const loadScene = useCallback(
+    (sceneUrl: string, positionsUrl: string, plyFallbackUrl?: string) => {
+      const frame = frameGroupRef.current;
+      if (!frame) return;
+
+      const thisLoadId = ++loadIdRef.current;
+
+      // Dispose old splat mesh immediately
+      if (splatMeshRef.current) {
+        frame.remove(splatMeshRef.current);
+        splatMeshRef.current.dispose();
+        splatMeshRef.current = null;
+      }
+      positionsRef.current = null;
+      kdTreeRef.current = null;
+
+      setLoading(true);
+      setError(null);
+      setNumSplats(0);
+
+      // Fetch scene file and positions sidecar in parallel
+      const fetchScene = async (): Promise<{ buf: ArrayBuffer; format: string }> => {
+        const res = await fetch(sceneUrl);
+        if (!res.ok) {
+          if (res.status === 404 && plyFallbackUrl) {
+            const r = await fetch(plyFallbackUrl);
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return { buf: await r.arrayBuffer(), format: "ply" };
+          }
+          throw new Error(`HTTP ${res.status}`);
+        }
+        return { buf: await res.arrayBuffer(), format: "auto" };
+      };
+
+      const posPromise = fetch(positionsUrl)
+        .then((res) => (res.ok ? res.arrayBuffer() : null))
+        .catch(() => null);
+
+      Promise.all([fetchScene(), posPromise])
+        .then(([sceneResult, posBuf]) => {
+          if (loadIdRef.current !== thisLoadId) return;
+
+          const { buf, format } = sceneResult;
+
+          // Determine if this is SPZ (magic bytes "NGSP") or PLY
+          const isSPZ =
+            format === "auto" &&
+            buf.byteLength >= 4 &&
+            new DataView(buf).getUint32(0, true) === 0x5053474e;
+
+          // For PLY, apply header patching; SPZ passes through directly
+          const fileBytes = isSPZ ? buf : patchPlyHeader(buf);
+
+          // Parse positions: prefer sidecar, fall back to PLY extraction
+          let posData: ReturnType<typeof parsePositionsSidecar> = null;
+          if (posBuf) {
+            posData = parsePositionsSidecar(posBuf);
+          }
+          if (!posData && !isSPZ) {
+            posData = extractPlyPositions(fileBytes);
+          }
+
+          if (posData) {
+            positionsRef.current = posData.positions;
+
+            const t0 = performance.now();
+            kdTreeRef.current = buildKDTree(posData.positions);
+            console.log(
+              `[useSplatScene] K-D tree built in ${(performance.now() - t0).toFixed(0)}ms for ${posData.nVerts.toLocaleString()} splats` +
+                (posBuf ? " (from sidecar)" : " (from PLY)"),
+            );
+
+            // Auto-center camera
+            if (controlsRef.current && cameraRef.current && frameGroupRef.current) {
+              const { centroid, radius } = posData;
+              const transformed = centroid
+                .clone()
+                .applyQuaternion(frameGroupRef.current.quaternion);
+              const cam = cameraRef.current;
+              const ctrl = controlsRef.current;
+              const dist = Math.max(radius * 1.5, 2);
+              ctrl.target.copy(transformed);
+              cam.position.set(
+                transformed.x + dist * 0.5,
+                transformed.y + dist * 0.3,
+                transformed.z - dist * 0.8,
+              );
+              ctrl.update();
+            }
+          }
+
+          // Dispose in case a concurrent load snuck in
+          if (splatMeshRef.current) {
+            frame.remove(splatMeshRef.current);
+            splatMeshRef.current.dispose();
+            splatMeshRef.current = null;
+          }
+
+          const mesh = new SplatMesh({ fileBytes });
+          frame.add(mesh);
+          splatMeshRef.current = mesh;
+          return mesh.initialized.then(() => {
+            if (loadIdRef.current !== thisLoadId) return;
+            setLoading(false);
+            setNumSplats(mesh.numSplats);
+          });
+        })
+        .catch((e: unknown) => {
+          if (loadIdRef.current !== thisLoadId) return;
+          console.error("Failed to load splat:", e);
+          setError(String(e));
+          setLoading(false);
+        });
+    },
+    [],
+  );
+
   const updateGizmo = useCallback(
     (centroid: THREE.Vector3 | null, mode: ToolMode) => {
       const scene = sceneRef.current;
@@ -658,6 +802,7 @@ export function useSplatScene(): SplatSceneHandle {
     error,
     numSplats,
     loadPly,
+    loadScene,
     splatMeshRef,
     positionsRef,
     sceneRef,

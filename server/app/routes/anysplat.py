@@ -227,6 +227,11 @@ async def run_anysplat(
         except Exception as e:
             logger.warning(f"Auto-cleanup failed (non-fatal): {e}")
 
+    # Generate SPZ + positions sidecar (best-effort)
+    if scene_ply.exists():
+        from utils.spz_convert import generate_spz_bundle
+        generate_spz_bundle(project_dir)
+
     # Determine resolution used
     from pipeline.run_anysplat_subprocess import pick_resolution
     resolution_used = body.resolution if body.resolution > 0 else pick_resolution(body.max_views)
