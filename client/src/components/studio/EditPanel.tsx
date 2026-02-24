@@ -262,7 +262,12 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
         {sceneLoaded && (
           <>
             <button
-              onClick={() => undoAction(projectId).then(() => useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 })))}
+              onClick={async () => {
+                await undoAction(projectId);
+                // Save to disk then reload to reflect the undo visually
+                await saveScene(projectId);
+                useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
+              }}
               disabled={undoCount === 0}
               title={`Undo (Ctrl+Z) — ${undoCount}`}
               className="p-1.5 rounded transition-colors text-gray-500 hover:text-white hover:bg-gray-800 disabled:opacity-30 disabled:cursor-default"
@@ -270,7 +275,12 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
               <Undo2 className="w-3.5 h-3.5" />
             </button>
             <button
-              onClick={() => redoAction(projectId).then(() => useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 })))}
+              onClick={async () => {
+                await redoAction(projectId);
+                // Save to disk then reload to reflect the redo visually
+                await saveScene(projectId);
+                useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
+              }}
               disabled={redoCount === 0}
               title={`Redo (Ctrl+Shift+Z) — ${redoCount}`}
               className="p-1.5 rounded transition-colors text-gray-500 hover:text-white hover:bg-gray-800 disabled:opacity-30 disabled:cursor-default"
@@ -278,7 +288,10 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
               <Redo2 className="w-3.5 h-3.5" />
             </button>
             <button
-              onClick={() => saveScene(projectId)}
+              onClick={async () => {
+                await saveScene(projectId);
+                useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
+              }}
               disabled={!isDirty || isSaving}
               title="Save (Ctrl+S)"
               className={`p-1.5 rounded transition-colors ${
@@ -338,6 +351,8 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
               try {
                 const mode = cropMode === "delete-inside" ? "inside" : "outside";
                 const isBox = toolMode === "crop-box";
+
+                // Apply the deletion server-side
                 const result = await editApi.deleteRegion(projectId, {
                   shape: isBox ? "box" : "sphere",
                   mode,
@@ -346,6 +361,12 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
                   center: !isBox && cropSphere ? cropSphere.center : undefined,
                   radius: !isBox && cropSphere ? cropSphere.radius : undefined,
                 });
+
+                // Hide deleted gaussians client-side (instant, no scene reload)
+                if (result.deleted_indices && result.deleted_indices.length > 0) {
+                  useEditorStore.getState().addDeletedIndices(result.deleted_indices);
+                }
+
                 useEditorStore.setState({
                   undoCount: result.undo_count,
                   redoCount: result.redo_count,
@@ -353,7 +374,6 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
                   cropBox: null,
                   cropSphere: null,
                 });
-                useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
                 setToolMode("select");
               } catch (e) {
                 console.error("Crop failed:", e);

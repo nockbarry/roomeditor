@@ -4,7 +4,12 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import { buildKDTree, queryNearest, type KDTreeNode } from "./useKDTree.ts";
+import { FlyCamera } from "./useFlyControls.ts";
+import { useEditorStore } from "../stores/editorStore.ts";
 import type { ToolMode } from "../types/scene.ts";
+
+/** Tool modes where orbit controls should be disabled (spatial tools). */
+const SPATIAL_TOOL_MODES: Set<ToolMode> = new Set(["brush", "eraser"]);
 
 /** Max f_rest properties Spark supports (SH degree 3 = 45). */
 const MAX_F_REST = 45;
@@ -196,6 +201,7 @@ export interface SplatSceneHandle {
   sceneRef: React.RefObject<THREE.Scene | null>;
   cameraRef: React.RefObject<THREE.PerspectiveCamera | null>;
   rendererRef: React.RefObject<THREE.WebGLRenderer | null>;
+  controlsRef: React.RefObject<OrbitControls | null>;
   kdTreeRef: React.RefObject<KDTreeNode | null>;
   getHitPointRef: React.RefObject<((event: MouseEvent) => { x: number; y: number; z: number } | null) | null>;
   onPickRef: React.RefObject<
@@ -230,8 +236,13 @@ export function useSplatScene(): SplatSceneHandle {
   const proxyStartPosRef = useRef<THREE.Vector3 | null>(null);
   const proxyStartQuatRef = useRef<THREE.Quaternion | null>(null);
   const proxyStartScaleRef = useRef<THREE.Vector3 | null>(null);
+  const draggingHandlerRef = useRef<((event: { value: unknown }) => void) | null>(null);
+  const flyCameraRef = useRef<FlyCamera | null>(null);
+  const lastTimeRef = useRef(0);
+  const cameraModeRef = useRef<"orbit" | "fps">("orbit");
   const initedRef = useRef(false);
   const loadIdRef = useRef(0);
+  const toolModeRef = useRef<ToolMode>("select");
 
   // For drag detection
   const mouseDownPosRef = useRef<{ x: number; y: number } | null>(null);
@@ -243,6 +254,46 @@ export function useSplatScene(): SplatSceneHandle {
   const [error, setError] = useState<string | null>(null);
   const [numSplats, setNumSplats] = useState(0);
   const [sceneFormat, setSceneFormat] = useState<SceneFormatInfo | null>(null);
+
+  // Keep toolModeRef in sync and toggle orbit controls
+  const toolMode = useEditorStore((s) => s.toolMode);
+  const cameraMode = useEditorStore((s) => s.cameraMode);
+  useEffect(() => {
+    toolModeRef.current = toolMode;
+    const controls = controlsRef.current;
+    if (controls) {
+      // Orbit controls disabled in fly mode or during spatial tools
+      controls.enabled = cameraModeRef.current === "orbit" && !SPATIAL_TOOL_MODES.has(toolMode);
+    }
+  }, [toolMode]);
+
+  // Handle camera mode switching (orbit <-> fly)
+  useEffect(() => {
+    cameraModeRef.current = cameraMode;
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    const container = containerRef.current;
+    const fly = flyCameraRef.current;
+    if (!camera || !controls || !container || !fly) return;
+
+    if (cameraMode === "fps") {
+      // Switch to fly mode
+      controls.enabled = false;
+      fly.activate(camera);
+      fly.speed = useEditorStore.getState().flySpeed;
+      fly.attach(container);
+    } else {
+      // Switch back to orbit mode
+      fly.detach();
+      fly.deactivate();
+      // Set orbit target in front of camera
+      const lookDir = new THREE.Vector3();
+      camera.getWorldDirection(lookDir);
+      controls.target.copy(camera.position).addScaledVector(lookDir, 5);
+      controls.enabled = !SPATIAL_TOOL_MODES.has(toolModeRef.current);
+      controls.update();
+    }
+  }, [cameraMode]);
 
   // Initialize Three.js + Spark once when container mounts
   useEffect(() => {
@@ -281,6 +332,11 @@ export function useSplatScene(): SplatSceneHandle {
     const spark = new SparkRenderer({ renderer });
     scene.add(spark);
     sparkRef.current = spark;
+
+    // Fly camera instance (not attached until mode switch)
+    const flyCamera = new FlyCamera();
+    flyCameraRef.current = flyCamera;
+    lastTimeRef.current = performance.now();
 
     // Frame group with Y-down convention (quaternion 180deg around X)
     const frame = new THREE.Group();
@@ -343,11 +399,13 @@ export function useSplatScene(): SplatSceneHandle {
     // --- Click-to-pick with drag detection ---
     const handleMouseDown = (e: MouseEvent) => {
       if (e.button !== 0) return; // left button only
+      if (SPATIAL_TOOL_MODES.has(toolModeRef.current)) return;
       mouseDownPosRef.current = { x: e.clientX, y: e.clientY };
     };
 
     const handleMouseUp = (e: MouseEvent) => {
       if (e.button !== 0) return;
+      if (SPATIAL_TOOL_MODES.has(toolModeRef.current)) return;
       const downPos = mouseDownPosRef.current;
       mouseDownPosRef.current = null;
       if (!downPos) return;
@@ -406,6 +464,7 @@ export function useSplatScene(): SplatSceneHandle {
 
     // --- Hover handler with throttle ---
     const handleMouseMove = (e: MouseEvent) => {
+      if (SPATIAL_TOOL_MODES.has(toolModeRef.current)) return;
       const now = performance.now();
       if (now - lastHoverTimeRef.current < HOVER_THROTTLE_MS) return;
       lastHoverTimeRef.current = now;
@@ -456,9 +515,17 @@ export function useSplatScene(): SplatSceneHandle {
     container.addEventListener("mousemove", handleMouseMove);
     container.addEventListener("mouseleave", handleMouseLeave);
 
-    // Animation loop
+    // Animation loop — branch on camera mode
     renderer.setAnimationLoop(() => {
-      controls.update();
+      const now = performance.now();
+      const dt = Math.min((now - lastTimeRef.current) / 1000, 0.1); // cap to avoid jumps
+      lastTimeRef.current = now;
+
+      if (cameraModeRef.current === "fps") {
+        flyCamera.update(camera, dt);
+      } else {
+        controls.update();
+      }
       renderer.render(scene, camera);
     });
 
@@ -483,6 +550,9 @@ export function useSplatScene(): SplatSceneHandle {
       container.removeEventListener("mouseleave", handleMouseLeave);
       ro.disconnect();
       renderer.setAnimationLoop(null);
+      flyCamera.detach();
+      flyCamera.deactivate();
+      flyCameraRef.current = null;
       if (splatMeshRef.current) {
         splatMeshRef.current.dispose();
         splatMeshRef.current = null;
@@ -735,8 +805,15 @@ export function useSplatScene(): SplatSceneHandle {
 
       if (!scene || !camera || !renderer || !controls) return;
 
-      // Remove existing gizmo
+      // Remove existing gizmo (clean up listener before dispose)
       if (transformControlsRef.current) {
+        if (draggingHandlerRef.current) {
+          transformControlsRef.current.removeEventListener(
+            "dragging-changed",
+            draggingHandlerRef.current as unknown as (event: object) => void,
+          );
+          draggingHandlerRef.current = null;
+        }
         transformControlsRef.current.detach();
         scene.remove(transformControlsRef.current as unknown as THREE.Object3D);
         transformControlsRef.current.dispose();
@@ -786,7 +863,7 @@ export function useSplatScene(): SplatSceneHandle {
       transformControlsRef.current = tc;
 
       // Disable orbit controls during gizmo drag
-      tc.addEventListener("dragging-changed", (event: { value: unknown }) => {
+      const draggingHandler = (event: { value: unknown }) => {
         const dragging = !!event.value;
         controls.enabled = !dragging;
 
@@ -836,7 +913,9 @@ export function useSplatScene(): SplatSceneHandle {
           proxyStartQuatRef.current = proxy.quaternion.clone();
           proxyStartScaleRef.current = proxy.scale.clone();
         }
-      });
+      };
+      tc.addEventListener("dragging-changed", draggingHandler);
+      draggingHandlerRef.current = draggingHandler;
     },
     []
   );
@@ -854,6 +933,7 @@ export function useSplatScene(): SplatSceneHandle {
     sceneRef,
     cameraRef,
     rendererRef,
+    controlsRef,
     kdTreeRef,
     getHitPointRef,
     onPickRef,

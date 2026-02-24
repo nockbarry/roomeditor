@@ -34,8 +34,9 @@ export function useKeyboardShortcuts({
         e.preventDefault();
         const editorStore = useEditorStore.getState();
         if (editorStore.sceneLoaded && editorStore.undoCount > 0) {
-          // Use in-memory undo
-          editorStore.undo(projectId).then(() => {
+          // In-memory undo, then save to disk + reload viewer
+          editorStore.undo(projectId).then(async () => {
+            await editorStore.saveScene(projectId);
             useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
           });
         } else {
@@ -55,7 +56,8 @@ export function useKeyboardShortcuts({
         e.preventDefault();
         const editorStore = useEditorStore.getState();
         if (editorStore.sceneLoaded && editorStore.redoCount > 0) {
-          editorStore.redo(projectId).then(() => {
+          editorStore.redo(projectId).then(async () => {
+            await editorStore.saveScene(projectId);
             useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
           });
         }
@@ -69,6 +71,14 @@ export function useKeyboardShortcuts({
         if (editorStore.sceneLoaded && editorStore.isDirty) {
           editorStore.saveScene(projectId);
         }
+        return;
+      }
+
+      // V — toggle camera mode (works in both build/edit modes)
+      if (!ctrl && !e.altKey && e.key.toLowerCase() === "v") {
+        e.preventDefault();
+        const { cameraMode, setCameraMode } = useEditorStore.getState();
+        setCameraMode(cameraMode === "orbit" ? "fps" : "orbit");
         return;
       }
 

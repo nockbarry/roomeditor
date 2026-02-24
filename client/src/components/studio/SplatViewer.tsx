@@ -47,6 +47,7 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
   const setHoveredSegment = useSegmentStore((s) => s.setHoveredSegment);
   const hoveredSegmentId = useSegmentStore((s) => s.hoveredSegmentId);
   const toolMode = useEditorStore((s) => s.toolMode);
+  const cameraMode = useEditorStore((s) => s.cameraMode);
   const loadSceneInMemory = useEditorStore((s) => s.loadScene);
   const sceneLoaded = useEditorStore((s) => s.sceneLoaded);
   const collabUsers = useCollabStore((s) => s.users);
@@ -429,7 +430,17 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
           </button>
         )}
         <span className="text-[10px] text-gray-600 bg-gray-900/80 px-2 py-1 rounded">
-          LMB drag to orbit &middot; Scroll to zoom &middot; RMB drag to pan
+          {cameraMode === "fps" ? (
+            <>
+              <span className="text-blue-400 font-medium">Fly</span>
+              {" "}&middot; WASD move &middot; QE up/down &middot; LMB look &middot; Scroll speed &middot; V orbit
+            </>
+          ) : (
+            <>
+              <span className="text-gray-400 font-medium">Orbit</span>
+              {" "}&middot; LMB orbit &middot; Scroll zoom &middot; RMB pan &middot; V fly
+            </>
+          )}
         </span>
       </div>
     </div>

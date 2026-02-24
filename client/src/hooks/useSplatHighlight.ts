@@ -21,107 +21,126 @@ export function useSplatHighlight(
   const segments = useSegmentStore((s) => s.segments);
   const segmentIndexMap = useSegmentStore((s) => s.segmentIndexMap);
   const brushSelection = useEditorStore((s) => s.brushSelection);
+  const deletedIndices = useEditorStore((s) => s.deletedIndices);
   const toolMode = useEditorStore((s) => s.toolMode);
 
   const rgbaRef = useRef<RgbaArray | null>(null);
+  const rafRef = useRef(0);
 
   useEffect(() => {
-    const mesh = splatMeshRef.current;
-    if (!mesh) return;
+    cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => {
+      const mesh = splatMeshRef.current;
+      if (!mesh) return;
 
-    const hasSelection = selectedSegmentIds.length > 0;
-    const hasHover = hoveredSegmentId !== null;
-    const hasBrush = brushSelection.size > 0;
-    const isBrushTool = toolMode === "brush" || toolMode === "eraser";
+      const hasSelection = selectedSegmentIds.length > 0;
+      const hasHover = hoveredSegmentId !== null;
+      const hasBrush = brushSelection.size > 0;
+      const hasDeleted = deletedIndices.size > 0;
+      const isBrushTool = toolMode === "brush" || toolMode === "eraser";
 
-    // If nothing active, clear highlight
-    if (
-      (!hasSelection && !hasHover && !hasBrush) ||
-      (!segmentIndexMap && !hasBrush) ||
-      (segmentIndexMap && segmentIndexMap.length !== mesh.numSplats && !hasBrush)
-    ) {
-      if (rgbaRef.current) {
-        mesh.splatRgba = null;
-        rgbaRef.current.dispose();
-        rgbaRef.current = null;
-      }
-      return;
-    }
-
-    const numSplats = mesh.numSplats;
-    const rgba = new Uint8Array(numSplats * 4);
-
-    // Build sets of selected segment values (1-based indices into segments array)
-    const selectedValues = new Set<number>();
-    for (const segId of selectedSegmentIds) {
-      const idx = segments.findIndex((s) => s.id === segId);
-      if (idx >= 0) selectedValues.add(idx + 1);
-    }
-
-    let hoveredValue = -1;
-    if (hoveredSegmentId !== null) {
-      const idx = segments.findIndex((s) => s.id === hoveredSegmentId);
-      if (idx >= 0) hoveredValue = idx + 1;
-    }
-
-    const anythingActive = hasSelection || hasHover || hasBrush;
-
-    for (let i = 0; i < numSplats; i++) {
-      const off = i * 4;
-      const segValue = segmentIndexMap ? segmentIndexMap[i] : 0;
-
-      if (hasBrush && brushSelection.has(i)) {
-        // Brush/eraser preview: orange for brush, red for eraser
-        if (toolMode === "eraser") {
-          rgba[off] = 255;
-          rgba[off + 1] = 100;
-          rgba[off + 2] = 100;
-          rgba[off + 3] = 200;
-        } else {
-          rgba[off] = 255;
-          rgba[off + 1] = 200;
-          rgba[off + 2] = 150;
-          rgba[off + 3] = 200;
+      // If nothing active, clear highlight
+      if (
+        (!hasSelection && !hasHover && !hasBrush && !hasDeleted) ||
+        (!segmentIndexMap && !hasBrush && !hasDeleted) ||
+        (segmentIndexMap && segmentIndexMap.length !== mesh.numSplats && !hasBrush && !hasDeleted)
+      ) {
+        if (rgbaRef.current) {
+          mesh.splatRgba = null;
+          rgbaRef.current.dispose();
+          rgbaRef.current = null;
         }
-      } else if (selectedValues.has(segValue)) {
-        // Selected: emerald tint
-        rgba[off] = 200;
-        rgba[off + 1] = 255;
-        rgba[off + 2] = 220;
-        rgba[off + 3] = 255;
-      } else if (segValue === hoveredValue) {
-        // Hovered: blue tint
-        rgba[off] = 200;
-        rgba[off + 1] = 210;
-        rgba[off + 2] = 255;
-        rgba[off + 3] = 240;
-      } else if (anythingActive && !isBrushTool) {
-        // Dimmed: desaturated but still readable
-        rgba[off] = 180;
-        rgba[off + 1] = 180;
-        rgba[off + 2] = 180;
-        rgba[off + 3] = 220;
-      } else {
-        // Identity: no modification
-        rgba[off] = 255;
-        rgba[off + 1] = 255;
-        rgba[off + 2] = 255;
-        rgba[off + 3] = 255;
+        return;
       }
-    }
 
-    if (rgbaRef.current) {
-      rgbaRef.current.dispose();
-    }
+      const numSplats = mesh.numSplats;
+      const rgba = new Uint8Array(numSplats * 4);
 
-    const rgbaArray = new RgbaArray({ array: rgba, count: numSplats });
-    rgbaRef.current = rgbaArray;
-    mesh.splatRgba = rgbaArray;
-  }, [selectedSegmentIds, hoveredSegmentId, segments, segmentIndexMap, brushSelection, toolMode, splatMeshRef]);
+      // Build sets of selected segment values (1-based indices into segments array)
+      const selectedValues = new Set<number>();
+      for (const segId of selectedSegmentIds) {
+        const idx = segments.findIndex((s) => s.id === segId);
+        if (idx >= 0) selectedValues.add(idx + 1);
+      }
+
+      let hoveredValue = -1;
+      if (hoveredSegmentId !== null) {
+        const idx = segments.findIndex((s) => s.id === hoveredSegmentId);
+        if (idx >= 0) hoveredValue = idx + 1;
+      }
+
+      const anythingActive = hasSelection || hasHover || hasBrush;
+
+      for (let i = 0; i < numSplats; i++) {
+        const off = i * 4;
+        const segValue = segmentIndexMap ? segmentIndexMap[i] : 0;
+
+        // Hide deleted gaussians (alpha = 0)
+        if (hasDeleted && deletedIndices.has(i)) {
+          rgba[off] = 0;
+          rgba[off + 1] = 0;
+          rgba[off + 2] = 0;
+          rgba[off + 3] = 0;
+          continue;
+        }
+
+        if (hasBrush && brushSelection.has(i)) {
+          // Brush/eraser preview: orange for brush, red for eraser
+          if (toolMode === "eraser") {
+            rgba[off] = 255;
+            rgba[off + 1] = 100;
+            rgba[off + 2] = 100;
+            rgba[off + 3] = 200;
+          } else {
+            rgba[off] = 255;
+            rgba[off + 1] = 200;
+            rgba[off + 2] = 150;
+            rgba[off + 3] = 200;
+          }
+        } else if (selectedValues.has(segValue)) {
+          // Selected: emerald tint
+          rgba[off] = 200;
+          rgba[off + 1] = 255;
+          rgba[off + 2] = 220;
+          rgba[off + 3] = 255;
+        } else if (segValue === hoveredValue) {
+          // Hovered: blue tint
+          rgba[off] = 200;
+          rgba[off + 1] = 210;
+          rgba[off + 2] = 255;
+          rgba[off + 3] = 240;
+        } else if (anythingActive && !isBrushTool) {
+          // Dimmed: desaturated but still readable
+          rgba[off] = 180;
+          rgba[off + 1] = 180;
+          rgba[off + 2] = 180;
+          rgba[off + 3] = 220;
+        } else {
+          // Identity: no modification
+          rgba[off] = 255;
+          rgba[off + 1] = 255;
+          rgba[off + 2] = 255;
+          rgba[off + 3] = 255;
+        }
+      }
+
+      if (rgbaRef.current) {
+        rgbaRef.current.dispose();
+      }
+
+      const rgbaArray = new RgbaArray({ array: rgba, count: numSplats });
+      rgbaArray.getTexture(); // Force upload CPU array → GPU DataArrayTexture
+      rgbaRef.current = rgbaArray;
+      mesh.splatRgba = rgbaArray;
+    });
+
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [selectedSegmentIds, hoveredSegmentId, segments, segmentIndexMap, brushSelection, deletedIndices, toolMode, splatMeshRef]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      cancelAnimationFrame(rafRef.current);
       if (rgbaRef.current) {
         const mesh = splatMeshRef.current;
         if (mesh) mesh.splatRgba = null;

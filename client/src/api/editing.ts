@@ -25,6 +25,7 @@ export interface EditResult {
   undo_count: number;
   redo_count: number;
   n_affected: number;
+  deleted_indices?: number[];
 }
 
 export interface HistoryEntry {

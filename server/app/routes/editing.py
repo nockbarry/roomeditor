@@ -358,7 +358,9 @@ async def delete_region(
         )
 
     if len(target_indices) == 0:
-        return {"status": "ok", "n_affected": 0, "undo_count": len(scene.undo_stack), "redo_count": len(scene.redo_stack)}
+        return {"status": "ok", "n_affected": 0, "undo_count": len(scene.undo_stack), "redo_count": len(scene.redo_stack), "deleted_indices": []}
 
-    result = scene.apply_edit(DeleteOp(indices=target_indices.tolist()))
-    return {"status": "ok", **result}
+    indices_list = target_indices.tolist()
+    result = scene.apply_edit(DeleteOp(indices=indices_list))
+    # Return deleted indices so client can hide them without reloading
+    return {"status": "ok", **result, "deleted_indices": indices_list}

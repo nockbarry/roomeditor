@@ -23,6 +23,12 @@ interface EditorStore {
   brushMode: "select" | "deselect";
   brushSelection: Set<number>;
 
+  // Client-side deleted indices (hidden via splatRgba, no scene reload needed)
+  deletedIndices: Set<number>;
+
+  // Fly camera state
+  flySpeed: number;
+
   // Crop state
   cropMode: "delete-inside" | "delete-outside";
   cropBox: { min: [number, number, number]; max: [number, number, number] } | null;
@@ -31,6 +37,7 @@ interface EditorStore {
   // Actions
   setToolMode: (mode: ToolMode) => void;
   setCameraMode: (mode: CameraMode) => void;
+  setFlySpeed: (speed: number) => void;
   selectObject: (id: string | null) => void;
   toggleGrid: () => void;
 
@@ -48,6 +55,10 @@ interface EditorStore {
   addToBrushSelection: (indices: number[]) => void;
   removeFromBrushSelection: (indices: number[]) => void;
   clearBrushSelection: () => void;
+
+  // Deleted indices actions
+  addDeletedIndices: (indices: number[]) => void;
+  clearDeletedIndices: () => void;
 
   // Crop actions
   setCropMode: (mode: "delete-inside" | "delete-outside") => void;
@@ -74,12 +85,17 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   brushMode: "select",
   brushSelection: new Set(),
 
+  deletedIndices: new Set(),
+
+  flySpeed: 2.0,
+
   cropMode: "delete-inside",
   cropBox: null,
   cropSphere: null,
 
   setToolMode: (mode) => set({ toolMode: mode }),
   setCameraMode: (mode) => set({ cameraMode: mode }),
+  setFlySpeed: (speed) => set({ flySpeed: Math.max(0.1, Math.min(50, speed)) }),
   selectObject: (id) => set({ selectedObjectId: id }),
   toggleGrid: () => set((state) => ({ showGrid: !state.showGrid })),
 
@@ -101,7 +117,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     set({ isSaving: true });
     try {
       const result = await editApi.saveScene(projectId);
-      set({ isSaving: false, isDirty: false });
+      set({ isSaving: false, isDirty: false, deletedIndices: new Set() });
       toast.success(`Scene saved (${result.save_time_sec}s)`);
     } catch (e) {
       console.error("Failed to save scene:", e);
@@ -133,6 +149,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         undoCount: result.undo_count,
         redoCount: result.redo_count,
         isDirty: true,
+        deletedIndices: new Set(), // Clear client-side deletions, need save+reload
       });
       toast.info(`Undo: ${result.label}`);
     } catch (e) {
@@ -147,6 +164,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         undoCount: result.undo_count,
         redoCount: result.redo_count,
         isDirty: true,
+        deletedIndices: new Set(), // Clear client-side deletions, need save+reload
       });
       toast.info(`Redo: ${result.label}`);
     } catch (e) {
@@ -184,6 +202,14 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }),
   clearBrushSelection: () => set({ brushSelection: new Set() }),
 
+  addDeletedIndices: (indices) =>
+    set((state) => {
+      const next = new Set(state.deletedIndices);
+      for (const i of indices) next.add(i);
+      return { deletedIndices: next };
+    }),
+  clearDeletedIndices: () => set({ deletedIndices: new Set() }),
+
   setCropMode: (mode) => set({ cropMode: mode }),
   setCropBox: (box) => set({ cropBox: box }),
   setCropSphere: (sphere) => set({ cropSphere: sphere }),
@@ -199,6 +225,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       brushRadius: 0.1,
       brushMode: "select",
       brushSelection: new Set(),
+      deletedIndices: new Set(),
+      flySpeed: 2.0,
       cropMode: "delete-inside",
       cropBox: null,
       cropSphere: null,
