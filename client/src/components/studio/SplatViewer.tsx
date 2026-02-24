@@ -6,6 +6,9 @@ import { useEditorStore } from "../../stores/editorStore.ts";
 import { useCollabStore } from "../../stores/collabStore.ts";
 import { useSplatScene } from "../../hooks/useSplatScene.ts";
 import { useSplatHighlight } from "../../hooks/useSplatHighlight.ts";
+import { useBrushTool } from "../../hooks/useBrushTool.ts";
+import { useEraserActions } from "../../hooks/useEraserTool.ts";
+import { CropOverlay } from "./CropOverlay.tsx";
 import { ModelProvenance } from "./ModelProvenance.tsx";
 import { Box, Loader2, Camera } from "lucide-react";
 
@@ -23,6 +26,7 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
   const {
     containerRef, loading, error, numSplats, sceneFormat, loadPly, loadScene,
     splatMeshRef, positionsRef, sceneRef, cameraRef, rendererRef,
+    kdTreeRef, getHitPointRef,
     onPickRef, onHoverRef, onGizmoDragEndRef, updateGizmo,
   } = useSplatScene();
 
@@ -43,7 +47,73 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
   const setHoveredSegment = useSegmentStore((s) => s.setHoveredSegment);
   const hoveredSegmentId = useSegmentStore((s) => s.hoveredSegmentId);
   const toolMode = useEditorStore((s) => s.toolMode);
+  const loadSceneInMemory = useEditorStore((s) => s.loadScene);
+  const sceneLoaded = useEditorStore((s) => s.sceneLoaded);
   const collabUsers = useCollabStore((s) => s.users);
+
+  // Load scene into server memory when the viewer loads a scene
+  useEffect(() => {
+    if (numSplats > 0 && !sceneLoaded && plyUrl?.includes(`/data/${projectId}/`)) {
+      loadSceneInMemory(projectId);
+    }
+  }, [numSplats, sceneLoaded, plyUrl, projectId, loadSceneInMemory]);
+
+  // Wire brush tool for brush/eraser modes
+  const getHitPoint = useCallback(
+    (event: MouseEvent) => getHitPointRef.current?.(event) ?? null,
+    [getHitPointRef],
+  );
+  useBrushTool(containerRef, kdTreeRef, positionsRef, getHitPoint);
+
+  // Wire eraser finalization (soft-delete brush selection on mouseup)
+  const { finalizeErase } = useEraserActions(projectId);
+  useEffect(() => {
+    if (toolMode !== "eraser") return;
+    const onUp = () => finalizeErase();
+    window.addEventListener("mouseup", onUp);
+    return () => window.removeEventListener("mouseup", onUp);
+  }, [toolMode, finalizeErase]);
+
+  // Crop tool state from editor store
+  const cropBox = useEditorStore((s) => s.cropBox);
+  const cropSphere = useEditorStore((s) => s.cropSphere);
+  const setCropBox = useEditorStore((s) => s.setCropBox);
+  const setCropSphere = useEditorStore((s) => s.setCropSphere);
+
+  // Initialize crop volumes when switching to crop tools
+  useEffect(() => {
+    if (toolMode === "crop-box" && !cropBox && positionsRef.current) {
+      const pos = positionsRef.current;
+      const n = pos.length / 3;
+      if (n === 0) return;
+      let minX = Infinity, minY = Infinity, minZ = Infinity;
+      let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      const step = Math.max(1, Math.floor(n / 1000));
+      for (let i = 0; i < n; i += step) {
+        const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+      }
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+      const sx = (maxX - minX) * 0.25, sy = (maxY - minY) * 0.25, sz = (maxZ - minZ) * 0.25;
+      setCropBox({ min: [cx - sx, cy - sy, cz - sz], max: [cx + sx, cy + sy, cz + sz] });
+    } else if (toolMode === "crop-sphere" && !cropSphere && positionsRef.current) {
+      const pos = positionsRef.current;
+      const n = pos.length / 3;
+      if (n === 0) return;
+      let sx = 0, sy = 0, sz = 0, count = 0;
+      const step = Math.max(1, Math.floor(n / 1000));
+      for (let i = 0; i < n; i += step) {
+        sx += pos[i * 3]; sy += pos[i * 3 + 1]; sz += pos[i * 3 + 2]; count++;
+      }
+      const cx = sx / count, cy = sy / count, cz = sz / count;
+      setCropSphere({ center: [cx, cy, cz], radius: 0.5 });
+    } else if (toolMode !== "crop-box" && toolMode !== "crop-sphere") {
+      setCropBox(null);
+      setCropSphere(null);
+    }
+  }, [toolMode, cropBox, cropSphere, positionsRef, setCropBox, setCropSphere]);
 
   // Render remote cursor spheres in the 3D scene
   const cursorMeshesRef = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -247,6 +317,13 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
     <div className={`flex-1 min-h-0 relative rounded-lg overflow-hidden bg-gray-900 border border-gray-800 ${hoveredSegmentId !== null ? "cursor-pointer" : ""}`}>
       {/* Canvas container — always rendered so useSplatScene can initialize */}
       <div ref={containerRef} className="absolute inset-0" />
+
+      {/* Crop volume overlay */}
+      <CropOverlay
+        scene={sceneRef.current}
+        cropBox={cropBox}
+        cropSphere={cropSphere}
+      />
 
       {/* Placeholder overlay — shown when no PLY and not running */}
       {!plyUrl && !isRunning && (

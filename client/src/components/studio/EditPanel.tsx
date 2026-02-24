@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { useAnySplatStore } from "../../stores/anysplatStore.ts";
 import { useEditorStore } from "../../stores/editorStore.ts";
+import * as editApi from "../../api/editing.ts";
 import { SplatBrowser } from "./SplatBrowser.tsx";
 import { SegmentPanel } from "./SegmentPanel.tsx";
 import { CompositionPanel } from "./CompositionPanel.tsx";
@@ -90,6 +91,8 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
   const setBrushRadius = useEditorStore((s) => s.setBrushRadius);
   const cropMode = useEditorStore((s) => s.cropMode);
   const setCropMode = useEditorStore((s) => s.setCropMode);
+  const cropBox = useEditorStore((s) => s.cropBox);
+  const cropSphere = useEditorStore((s) => s.cropSphere);
 
   const refinePreset = useAnySplatStore((s) => s.refinePreset);
   const setRefinePreset = useAnySplatStore((s) => s.setRefinePreset);
@@ -307,26 +310,59 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
         </div>
       )}
       {(toolMode === "crop-box" || toolMode === "crop-sphere") && (
-        <div className="px-3 py-1.5 border-b border-gray-800 flex items-center gap-2">
+        <div className="px-3 py-1.5 border-b border-gray-800 space-y-1.5">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setCropMode("delete-inside")}
+              className={`flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+                cropMode === "delete-inside"
+                  ? "bg-red-600/30 text-red-300 border border-red-600/40"
+                  : "bg-gray-900 text-gray-500 border border-gray-800"
+              }`}
+            >
+              Delete Inside
+            </button>
+            <button
+              onClick={() => setCropMode("delete-outside")}
+              className={`flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+                cropMode === "delete-outside"
+                  ? "bg-blue-600/30 text-blue-300 border border-blue-600/40"
+                  : "bg-gray-900 text-gray-500 border border-gray-800"
+              }`}
+            >
+              Delete Outside
+            </button>
+          </div>
           <button
-            onClick={() => setCropMode("delete-inside")}
-            className={`flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
-              cropMode === "delete-inside"
-                ? "bg-red-600/30 text-red-300 border border-red-600/40"
-                : "bg-gray-900 text-gray-500 border border-gray-800"
-            }`}
+            onClick={async () => {
+              try {
+                const mode = cropMode === "delete-inside" ? "inside" : "outside";
+                const isBox = toolMode === "crop-box";
+                const result = await editApi.deleteRegion(projectId, {
+                  shape: isBox ? "box" : "sphere",
+                  mode,
+                  min: isBox && cropBox ? cropBox.min : undefined,
+                  max: isBox && cropBox ? cropBox.max : undefined,
+                  center: !isBox && cropSphere ? cropSphere.center : undefined,
+                  radius: !isBox && cropSphere ? cropSphere.radius : undefined,
+                });
+                useEditorStore.setState({
+                  undoCount: result.undo_count,
+                  redoCount: result.redo_count,
+                  isDirty: true,
+                  cropBox: null,
+                  cropSphere: null,
+                });
+                useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
+                setToolMode("select");
+              } catch (e) {
+                console.error("Crop failed:", e);
+              }
+            }}
+            disabled={!sceneLoaded || (toolMode === "crop-box" && !cropBox) || (toolMode === "crop-sphere" && !cropSphere)}
+            className="w-full px-2 py-1.5 rounded text-[10px] font-medium bg-red-900/40 hover:bg-red-900/60 text-red-300 transition-colors disabled:opacity-40"
           >
-            Delete Inside
-          </button>
-          <button
-            onClick={() => setCropMode("delete-outside")}
-            className={`flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
-              cropMode === "delete-outside"
-                ? "bg-blue-600/30 text-blue-300 border border-blue-600/40"
-                : "bg-gray-900 text-gray-500 border border-gray-800"
-            }`}
-          >
-            Delete Outside
+            Apply Crop
           </button>
         </div>
       )}

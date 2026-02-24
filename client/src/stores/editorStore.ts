@@ -25,6 +25,8 @@ interface EditorStore {
 
   // Crop state
   cropMode: "delete-inside" | "delete-outside";
+  cropBox: { min: [number, number, number]; max: [number, number, number] } | null;
+  cropSphere: { center: [number, number, number]; radius: number } | null;
 
   // Actions
   setToolMode: (mode: ToolMode) => void;
@@ -49,6 +51,8 @@ interface EditorStore {
 
   // Crop actions
   setCropMode: (mode: "delete-inside" | "delete-outside") => void;
+  setCropBox: (box: { min: [number, number, number]; max: [number, number, number] } | null) => void;
+  setCropSphere: (sphere: { center: [number, number, number]; radius: number } | null) => void;
 
   resetEditing: () => void;
 }
@@ -71,6 +75,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   brushSelection: new Set(),
 
   cropMode: "delete-inside",
+  cropBox: null,
+  cropSphere: null,
 
   setToolMode: (mode) => set({ toolMode: mode }),
   setCameraMode: (mode) => set({ cameraMode: mode }),
@@ -179,6 +185,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   clearBrushSelection: () => set({ brushSelection: new Set() }),
 
   setCropMode: (mode) => set({ cropMode: mode }),
+  setCropBox: (box) => set({ cropBox: box }),
+  setCropSphere: (sphere) => set({ cropSphere: sphere }),
 
   resetEditing: () =>
     set({
@@ -192,5 +200,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       brushMode: "select",
       brushSelection: new Set(),
       cropMode: "delete-inside",
+      cropBox: null,
+      cropSphere: null,
     }),
 }));

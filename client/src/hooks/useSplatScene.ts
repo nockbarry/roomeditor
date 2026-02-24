@@ -196,6 +196,8 @@ export interface SplatSceneHandle {
   sceneRef: React.RefObject<THREE.Scene | null>;
   cameraRef: React.RefObject<THREE.PerspectiveCamera | null>;
   rendererRef: React.RefObject<THREE.WebGLRenderer | null>;
+  kdTreeRef: React.RefObject<KDTreeNode | null>;
+  getHitPointRef: React.RefObject<((event: MouseEvent) => { x: number; y: number; z: number } | null) | null>;
   onPickRef: React.RefObject<
     ((splatIdx: number | null, point: THREE.Vector3 | null) => void) | null
   >;
@@ -215,6 +217,9 @@ export function useSplatScene(): SplatSceneHandle {
   const splatMeshRef = useRef<SplatMesh | null>(null);
   const positionsRef = useRef<Float32Array | null>(null);
   const kdTreeRef = useRef<KDTreeNode | null>(null);
+  const getHitPointRef = useRef<
+    ((event: MouseEvent) => { x: number; y: number; z: number } | null) | null
+  >(null);
   const onPickRef = useRef<
     ((splatIdx: number | null, point: THREE.Vector3 | null) => void) | null
   >(null);
@@ -293,6 +298,22 @@ export function useSplatScene(): SplatSceneHandle {
         const invQ = frameGroup.quaternion.clone().invert();
         hitWorld.applyQuaternion(invQ);
       }
+    };
+
+    // Expose getHitPoint for brush/eraser tools
+    getHitPointRef.current = (e: MouseEvent): { x: number; y: number; z: number } | null => {
+      const mesh = splatMeshRef.current;
+      if (!mesh) return null;
+      const rect = container.getBoundingClientRect();
+      const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+      const intersects: { distance: number; point: THREE.Vector3; object: THREE.Object3D }[] = [];
+      mesh.raycast(raycaster, intersects);
+      if (intersects.length === 0) return null;
+      const hitWorld = intersects[0].point.clone();
+      worldToLocal(hitWorld);
+      return { x: hitWorld.x, y: hitWorld.y, z: hitWorld.z };
     };
 
     // Double-click to re-center orbit target
@@ -833,6 +854,8 @@ export function useSplatScene(): SplatSceneHandle {
     sceneRef,
     cameraRef,
     rendererRef,
+    kdTreeRef,
+    getHitPointRef,
     onPickRef,
     onHoverRef,
     onGizmoDragEndRef,
