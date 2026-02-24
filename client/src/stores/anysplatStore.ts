@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { FrameInfo, AnySplatRunResult } from "../types/api.ts";
 import * as anysplatApi from "../api/anysplat.ts";
-import type { QualityStats, PruneResult, RefineResult, ComparisonPair, RefineMetrics, RefineEval } from "../api/postprocess.ts";
+import type { QualityStats, PruneResult, RefineResult, ComparisonPair, RefineMetrics, RefineEval, ModelInfo } from "../api/postprocess.ts";
 import * as postprocessApi from "../api/postprocess.ts";
 import { toast } from "./toastStore.ts";
 
@@ -38,6 +38,9 @@ interface AnySplatStore {
   comparisonPairs: ComparisonPair[];
   showComparison: boolean;
   comparisonBeforeUrl: string | null;
+  modelInfo: ModelInfo | null;
+  activeStageId: string | null;
+  activeFormat: "ply" | "spz";
 
   // Actions
   extractFrames: (projectId: string, fps?: number) => Promise<void>;
@@ -61,6 +64,9 @@ interface AnySplatStore {
   fetchComparisonInfo: (projectId: string) => Promise<void>;
   setShowComparison: (show: boolean) => void;
   setComparisonBeforeUrl: (url: string | null) => void;
+  fetchModelInfo: (projectId: string) => Promise<void>;
+  switchStage: (projectId: string, stageId: string) => void;
+  setActiveFormat: (projectId: string, format: "ply" | "spz") => void;
   reset: () => void;
 }
 
@@ -122,6 +128,9 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
   comparisonPairs: [],
   showComparison: false,
   comparisonBeforeUrl: null,
+  modelInfo: null,
+  activeStageId: null,
+  activeFormat: "spz",
 
   extractFrames: async (projectId: string, fps?: number) => {
     const fpsToUse = fps ?? get().fps;
@@ -220,8 +229,9 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
         plyUrl: result.ply_url,
         plyVersion: s.plyVersion + 1,
       }));
-      // Auto-fetch quality stats after rebuild
+      // Auto-fetch quality stats + model info after rebuild
       get().fetchQualityStats(projectId);
+      get().fetchModelInfo(projectId);
       toast.success(`Reconstruction complete — ${result.n_gaussians.toLocaleString()} gaussians`);
     } catch (e) {
       console.error("Failed to run AnySplat:", e);
@@ -241,6 +251,7 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
       }));
       get().fetchQualityStats(projectId);
       get().fetchComparisonInfo(projectId);
+      get().fetchModelInfo(projectId);
       toast.success(`Pruned ${result.n_pruned.toLocaleString()} floaters`);
     } catch (e) {
       console.error("Failed to prune:", e);
@@ -313,6 +324,7 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
       }));
       get().fetchQualityStats(projectId);
       get().fetchComparisonInfo(projectId);
+      get().fetchModelInfo(projectId);
       toast.success("Refinement complete");
     } catch (e) {
       console.error("Failed to refine:", e);
@@ -358,6 +370,59 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
   setShowComparison: (show) => set({ showComparison: show }),
   setComparisonBeforeUrl: (url) => set({ comparisonBeforeUrl: url }),
 
+  fetchModelInfo: async (projectId: string) => {
+    try {
+      const info = await postprocessApi.getModelInfo(projectId);
+      set({
+        modelInfo: info,
+        activeStageId: info.current_stage,
+      });
+    } catch (e) {
+      console.error("Failed to fetch model info:", e);
+    }
+  },
+
+  switchStage: (projectId: string, stageId: string) => {
+    const { modelInfo } = get();
+    if (!modelInfo) return;
+
+    const stage = modelInfo.stages.find((s) => s.id === stageId);
+    if (!stage || !stage.exists) return;
+
+    // Close any active comparison
+    set({ showComparison: false, comparisonBeforeUrl: null });
+
+    // Determine URL: prefer the active format if available, else use PLY
+    const activeFormat = get().activeFormat;
+    const file = stage.files[activeFormat] ?? stage.files.ply;
+    if (!file) return;
+
+    set((s) => ({
+      activeStageId: stageId,
+      plyUrl: file.url,
+      plyVersion: s.plyVersion + 1,
+    }));
+  },
+
+  setActiveFormat: (projectId: string, format: "ply" | "spz") => {
+    const { modelInfo, activeStageId } = get();
+    set({ activeFormat: format });
+
+    if (!modelInfo || !activeStageId) return;
+
+    // Only reload if we're on the current stage (which has both formats)
+    const stage = modelInfo.stages.find((s) => s.id === activeStageId);
+    if (!stage || !stage.exists) return;
+
+    const file = stage.files[format] ?? stage.files.ply;
+    if (!file) return;
+
+    set((s) => ({
+      plyUrl: file.url,
+      plyVersion: s.plyVersion + 1,
+    }));
+  },
+
   reset: () => {
     set({
       frames: [],
@@ -392,6 +457,9 @@ export const useAnySplatStore = create<AnySplatStore>((set, get) => ({
       comparisonPairs: [],
       showComparison: false,
       comparisonBeforeUrl: null,
+      modelInfo: null,
+      activeStageId: null,
+      activeFormat: "spz",
     });
   },
 }));

@@ -1,16 +1,17 @@
 import { useEffect, useRef, type RefObject } from "react";
 import { SplatMesh, RgbaArray } from "@sparkjsdev/spark";
 import { useSegmentStore } from "../stores/segmentStore.ts";
+import { useEditorStore } from "../stores/editorStore.ts";
 
 /**
- * Uses splatRgba (GPU per-splat RGBA texture) to highlight splats based on
- * selection and hover state.
+ * Per-splat RGBA highlighting with multiple visual states.
  *
- * Three visual states:
- * - Selected:  (255, 255, 255, 255) — full brightness
- * - Hovered:   (180, 190, 255, 220) — slight blue tint
- * - Dimmed:    (80, 80, 80, 160) — unselected/unhovered when something is active
- * - No selection and no hover: mesh.splatRgba = null → original colors
+ * States (splatRgba is a multiplicative blend with original color):
+ * - Selected:      (200, 255, 220, 255) — subtle emerald tint, preserves color
+ * - Hovered:       (200, 210, 255, 240) — slight blue tint
+ * - Brush preview: (255, 200, 150, 200) — orange tint for brush/eraser preview
+ * - Dimmed:        (180, 180, 180, 220) — desaturated but still readable (~70%)
+ * - No active state: splatRgba = null → original colors
  */
 export function useSplatHighlight(
   splatMeshRef: RefObject<SplatMesh | null>,
@@ -19,8 +20,9 @@ export function useSplatHighlight(
   const hoveredSegmentId = useSegmentStore((s) => s.hoveredSegmentId);
   const segments = useSegmentStore((s) => s.segments);
   const segmentIndexMap = useSegmentStore((s) => s.segmentIndexMap);
+  const brushSelection = useEditorStore((s) => s.brushSelection);
+  const toolMode = useEditorStore((s) => s.toolMode);
 
-  // Track the RgbaArray we created so we can dispose it
   const rgbaRef = useRef<RgbaArray | null>(null);
 
   useEffect(() => {
@@ -29,12 +31,14 @@ export function useSplatHighlight(
 
     const hasSelection = selectedSegmentIds.length > 0;
     const hasHover = hoveredSegmentId !== null;
+    const hasBrush = brushSelection.size > 0;
+    const isBrushTool = toolMode === "brush" || toolMode === "eraser";
 
-    // If nothing active, or index map doesn't match mesh, clear highlight
+    // If nothing active, clear highlight
     if (
-      (!hasSelection && !hasHover) ||
-      !segmentIndexMap ||
-      segmentIndexMap.length !== mesh.numSplats
+      (!hasSelection && !hasHover && !hasBrush) ||
+      (!segmentIndexMap && !hasBrush) ||
+      (segmentIndexMap && segmentIndexMap.length !== mesh.numSplats && !hasBrush)
     ) {
       if (rgbaRef.current) {
         mesh.splatRgba = null;
@@ -44,11 +48,14 @@ export function useSplatHighlight(
       return;
     }
 
-    // Build sets of selected and hovered segment values (1-based indices into segments array)
+    const numSplats = mesh.numSplats;
+    const rgba = new Uint8Array(numSplats * 4);
+
+    // Build sets of selected segment values (1-based indices into segments array)
     const selectedValues = new Set<number>();
     for (const segId of selectedSegmentIds) {
       const idx = segments.findIndex((s) => s.id === segId);
-      if (idx >= 0) selectedValues.add(idx + 1); // 1-based like the index map
+      if (idx >= 0) selectedValues.add(idx + 1);
     }
 
     let hoveredValue = -1;
@@ -57,35 +64,52 @@ export function useSplatHighlight(
       if (idx >= 0) hoveredValue = idx + 1;
     }
 
-    const numSplats = segmentIndexMap.length;
-    const rgba = new Uint8Array(numSplats * 4);
+    const anythingActive = hasSelection || hasHover || hasBrush;
 
     for (let i = 0; i < numSplats; i++) {
-      const segValue = segmentIndexMap[i];
       const off = i * 4;
+      const segValue = segmentIndexMap ? segmentIndexMap[i] : 0;
 
-      if (selectedValues.has(segValue)) {
-        // Selected: full brightness
+      if (hasBrush && brushSelection.has(i)) {
+        // Brush/eraser preview: orange for brush, red for eraser
+        if (toolMode === "eraser") {
+          rgba[off] = 255;
+          rgba[off + 1] = 100;
+          rgba[off + 2] = 100;
+          rgba[off + 3] = 200;
+        } else {
+          rgba[off] = 255;
+          rgba[off + 1] = 200;
+          rgba[off + 2] = 150;
+          rgba[off + 3] = 200;
+        }
+      } else if (selectedValues.has(segValue)) {
+        // Selected: emerald tint
+        rgba[off] = 200;
+        rgba[off + 1] = 255;
+        rgba[off + 2] = 220;
+        rgba[off + 3] = 255;
+      } else if (segValue === hoveredValue) {
+        // Hovered: blue tint
+        rgba[off] = 200;
+        rgba[off + 1] = 210;
+        rgba[off + 2] = 255;
+        rgba[off + 3] = 240;
+      } else if (anythingActive && !isBrushTool) {
+        // Dimmed: desaturated but still readable
+        rgba[off] = 180;
+        rgba[off + 1] = 180;
+        rgba[off + 2] = 180;
+        rgba[off + 3] = 220;
+      } else {
+        // Identity: no modification
         rgba[off] = 255;
         rgba[off + 1] = 255;
         rgba[off + 2] = 255;
         rgba[off + 3] = 255;
-      } else if (segValue === hoveredValue) {
-        // Hovered (not selected): blue tint
-        rgba[off] = 180;
-        rgba[off + 1] = 190;
-        rgba[off + 2] = 255;
-        rgba[off + 3] = 220;
-      } else {
-        // Dimmed
-        rgba[off] = 80;
-        rgba[off + 1] = 80;
-        rgba[off + 2] = 80;
-        rgba[off + 3] = 160;
       }
     }
 
-    // Dispose old RgbaArray if any
     if (rgbaRef.current) {
       rgbaRef.current.dispose();
     }
@@ -93,7 +117,7 @@ export function useSplatHighlight(
     const rgbaArray = new RgbaArray({ array: rgba, count: numSplats });
     rgbaRef.current = rgbaArray;
     mesh.splatRgba = rgbaArray;
-  }, [selectedSegmentIds, hoveredSegmentId, segments, segmentIndexMap, splatMeshRef]);
+  }, [selectedSegmentIds, hoveredSegmentId, segments, segmentIndexMap, brushSelection, toolMode, splatMeshRef]);
 
   // Cleanup on unmount
   useEffect(() => {

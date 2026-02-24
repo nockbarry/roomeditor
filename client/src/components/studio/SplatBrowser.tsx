@@ -16,6 +16,14 @@ function formatCount(n: number | null): string {
   return String(n);
 }
 
+function formatSize(bytes: number | null): string {
+  if (!bytes) return "";
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}G`;
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))}M`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)}K`;
+  return `${bytes}B`;
+}
+
 export function SplatBrowser({ currentProjectId, onClose }: SplatBrowserProps) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
@@ -75,11 +83,21 @@ export function SplatBrowser({ currentProjectId, onClose }: SplatBrowserProps) {
                   <span className="text-[9px] text-emerald-400 ml-2 shrink-0">current</span>
                 )}
               </div>
-              <div className="flex items-center gap-2 mt-0.5">
+              <div className="flex items-center gap-2 mt-0.5 flex-wrap">
                 <span className="text-[10px] text-gray-500 flex items-center gap-0.5">
                   <Box className="w-2.5 h-2.5" />
                   {formatCount(p.gaussian_count)}
                 </span>
+                {p.spz_size_bytes && (
+                  <span className="text-[9px] text-emerald-400/80">
+                    SPZ {formatSize(p.spz_size_bytes)}
+                  </span>
+                )}
+                {p.ply_size_bytes && (
+                  <span className="text-[9px] text-gray-500">
+                    PLY {formatSize(p.ply_size_bytes)}
+                  </span>
+                )}
                 <span className={`text-[9px] px-1.5 py-0.5 rounded ${
                   p.reconstruction_mode === "anysplat"
                     ? "bg-emerald-900/30 text-emerald-400"

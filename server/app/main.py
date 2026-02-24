@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import engine
 from app.models import Base
-from app.routes import anysplat, benchmarks, collab, jobs, objects, postprocess, projects, segments, ws
+from app.routes import anysplat, benchmarks, collab, editing, jobs, objects, postprocess, projects, segments, ws
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +45,7 @@ app.add_middleware(
 app.include_router(projects.router)
 app.include_router(anysplat.router)
 app.include_router(segments.router)
+app.include_router(editing.router)
 app.include_router(postprocess.router)
 app.include_router(objects.router)
 app.include_router(jobs.router)

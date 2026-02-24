@@ -165,3 +165,102 @@ export function queryNearest(
   search(tree);
   return bestIdx;
 }
+
+/**
+ * Find all splat indices within `radius` of the query point.
+ * Uses KD-tree branch pruning for efficiency.
+ */
+export function queryRadius(
+  tree: KDTreeNode | null,
+  positions: Float32Array,
+  cx: number,
+  cy: number,
+  cz: number,
+  radius: number,
+): Uint32Array {
+  if (!tree) return new Uint32Array(0);
+
+  const radiusSq = radius * radius;
+  const results: number[] = [];
+  const center = [cx, cy, cz];
+
+  function search(node: KDTreeNode | null): void {
+    if (!node) return;
+
+    const ni = node.idx;
+    const dx = positions[ni * 3] - cx;
+    const dy = positions[ni * 3 + 1] - cy;
+    const dz = positions[ni * 3 + 2] - cz;
+    const distSq = dx * dx + dy * dy + dz * dz;
+
+    if (distSq <= radiusSq) {
+      results.push(ni);
+    }
+
+    // Distance from query to splitting plane
+    const diff = center[node.axis] - node.split;
+
+    // Search the nearer side first
+    const first = diff < 0 ? node.left : node.right;
+    const second = diff < 0 ? node.right : node.left;
+
+    search(first);
+
+    // Only search the other side if the splitting plane is within radius
+    if (diff * diff <= radiusSq) {
+      search(second);
+    }
+  }
+
+  search(tree);
+  return new Uint32Array(results);
+}
+
+/**
+ * Find all splat indices within an axis-aligned bounding box.
+ * Uses KD-tree branch pruning — skips entire subtrees when the
+ * splitting plane is outside the query box on the relevant axis.
+ */
+export function queryBox(
+  tree: KDTreeNode | null,
+  positions: Float32Array,
+  minPt: [number, number, number],
+  maxPt: [number, number, number],
+): Uint32Array {
+  if (!tree) return new Uint32Array(0);
+
+  const results: number[] = [];
+
+  function search(node: KDTreeNode | null): void {
+    if (!node) return;
+
+    const ni = node.idx;
+    const px = positions[ni * 3];
+    const py = positions[ni * 3 + 1];
+    const pz = positions[ni * 3 + 2];
+
+    if (
+      px >= minPt[0] && px <= maxPt[0] &&
+      py >= minPt[1] && py <= maxPt[1] &&
+      pz >= minPt[2] && pz <= maxPt[2]
+    ) {
+      results.push(ni);
+    }
+
+    // Check if left/right subtrees could contain points in the box
+    const splitVal = node.split;
+    const axis = node.axis;
+
+    // Left subtree has values <= splitVal on this axis
+    if (minPt[axis] <= splitVal) {
+      search(node.left);
+    }
+    // Right subtree has values >= splitVal on this axis
+    if (maxPt[axis] >= splitVal) {
+      search(node.right);
+    }
+  }
+
+  search(tree);
+  return new Uint32Array(results);
+}

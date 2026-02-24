@@ -18,6 +18,8 @@ class ProjectResponse(BaseModel):
     gaussian_count: int | None = None
     reconstruction_mode: str | None = None
     error_message: str | None = None
+    ply_size_bytes: int | None = None
+    spz_size_bytes: int | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -172,6 +174,10 @@ class ClickSegmentRequest(BaseModel):
     frame: str
     x: int
     y: int
+
+
+class ClickSegment3DRequest(BaseModel):
+    point: list[float]  # [x, y, z] in world space
 
 
 class SegmentTransformRequest(BaseModel):

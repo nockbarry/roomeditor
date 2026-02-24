@@ -1,4 +1,4 @@
-export type ToolMode = "select" | "translate" | "rotate" | "scale";
+export type ToolMode = "select" | "translate" | "rotate" | "scale" | "brush" | "eraser" | "crop-box" | "crop-sphere";
 
 export type CameraMode = "orbit" | "fps";
 

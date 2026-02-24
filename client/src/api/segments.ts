@@ -25,6 +25,13 @@ export async function clickSegment(
   return api.post<SegmentInfo>(`/projects/${projectId}/click-segment`, { frame, x, y });
 }
 
+export async function clickSegment3D(
+  projectId: string,
+  point: [number, number, number],
+): Promise<SegmentInfo> {
+  return api.post<SegmentInfo>(`/projects/${projectId}/click-segment-3d`, { point });
+}
+
 export async function getSegments(projectId: string): Promise<SegmentManifest> {
   return api.get<SegmentManifest>(`/projects/${projectId}/segments`);
 }

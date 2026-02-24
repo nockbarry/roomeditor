@@ -37,6 +37,14 @@ function formatGaussianCount(n: number | null): string {
   return String(n);
 }
 
+function formatFileSize(bytes: number | null): string {
+  if (!bytes) return "";
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
 function formatRelativeTime(dateStr: string): string {
   const date = new Date(dateStr);
   const now = new Date();
@@ -232,6 +240,8 @@ function ProjectCard({
   onDelete: (e: React.MouseEvent) => void;
 }) {
   const gsCount = formatGaussianCount(project.gaussian_count);
+  const plySize = formatFileSize(project.ply_size_bytes);
+  const spzSize = formatFileSize(project.spz_size_bytes);
 
   return (
     <div
@@ -246,7 +256,18 @@ function ProjectCard({
             {gsCount && (
               <span className="text-gray-400">{gsCount} Gaussians</span>
             )}
-            {gsCount && <span className="text-gray-700">|</span>}
+            {(plySize || spzSize) && (
+              <>
+                <span className="text-gray-700">|</span>
+                {spzSize && (
+                  <span className="text-emerald-400/80">SPZ {spzSize}</span>
+                )}
+                {plySize && (
+                  <span className="text-gray-500">PLY {plySize}</span>
+                )}
+              </>
+            )}
+            {(gsCount || plySize || spzSize) && <span className="text-gray-700">|</span>}
             <span title={formatFullTimestamp(project.created_at)}>
               {formatRelativeTime(project.created_at)}
             </span>

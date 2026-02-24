@@ -18,6 +18,7 @@ from app.database import get_db
 from app.models import Project
 from app.schemas import (
     BatchTransformRequest,
+    ClickSegment3DRequest,
     ClickSegmentRequest,
     DuplicateRequest,
     LightingRequest,
@@ -242,6 +243,14 @@ async def delete_gaussians_by_ids(
     if not ply_path.exists():
         raise HTTPException(status_code=400, detail="No scene.ply found")
 
+    # Try in-memory path first
+    from pipeline.scene_manager import get_cached_scene, DeleteOp
+    scene = get_cached_scene(project_id)
+    if scene and scene.data is not None:
+        scene.apply_edit(DeleteOp(indices=gaussian_ids))
+        return {"status": "ok", "removed_gaussians": len(gaussian_ids)}
+
+    # Fallback: direct PLY I/O
     _save_checkpoint(project_dir, f"delete {len(gaussian_ids)} gaussians")
 
     import asyncio
@@ -292,6 +301,108 @@ async def click_segment(
 def _run_click_segment(frames_dir, project_dir, frame, x, y) -> dict:
     from pipeline.segment_objects import click_segment_project
     return click_segment_project(frames_dir, project_dir, frame, x, y)
+
+
+@router.post("/{project_id}/click-segment-3d", response_model=SegmentInfo)
+async def click_segment_3d(
+    project_id: str,
+    body: ClickSegment3DRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Segment an object from a 3D point click.
+
+    Projects the world-space point into all camera frames, picks the frame
+    where the point is most central, then runs SAM2 click segmentation.
+    """
+    await _require_project(project_id, db)
+    project_dir = _get_project_dir(project_id)
+
+    cameras_path = project_dir / "cameras.json"
+    if not cameras_path.exists():
+        raise HTTPException(status_code=404, detail="cameras.json not found")
+
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        segment = await loop.run_in_executor(
+            _segment_executor,
+            lambda: _run_click_segment_3d(project_dir, body.point),
+        )
+    except Exception as e:
+        logger.error(f"Click-segment-3d failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return segment
+
+
+def _run_click_segment_3d(project_dir: Path, point: list[float]) -> dict:
+    """Project a 3D point into camera frames and run SAM2 on the best one."""
+    from pipeline.segment_objects import click_segment_project
+
+    cameras_path = project_dir / "cameras.json"
+    cam_data = json.loads(cameras_path.read_text())
+    cameras = cam_data["cameras"]
+    resolution = cam_data.get("resolution", 448)
+
+    pt = np.array(point, dtype=np.float64)
+    best_frame = None
+    best_score = -1.0
+    best_u, best_v = 0, 0
+
+    for cam in cameras:
+        transform = np.array(cam["transform"], dtype=np.float64)
+        if transform.shape[0] == 4:
+            transform = transform[:3]
+
+        R = transform[:, :3]
+        t = transform[:, 3]
+
+        # Camera-to-world -> world-to-camera
+        R_inv = R.T
+        t_inv = -R_inv @ t
+
+        xyz_cam = R_inv @ pt + t_inv
+
+        # Must be in front of camera
+        if xyz_cam[2] <= 0.01:
+            continue
+
+        fx = cam.get("fx", resolution * 0.85)
+        fy = cam.get("fy", fx)
+        cx = cam.get("cx", resolution / 2)
+        cy = cam.get("cy", resolution / 2)
+
+        u = fx * xyz_cam[0] / xyz_cam[2] + cx
+        v = fy * xyz_cam[1] / xyz_cam[2] + cy
+
+        # Check in-bounds
+        if u < 0 or u >= resolution or v < 0 or v >= resolution:
+            continue
+
+        # Score: prefer frames where the point is most central
+        # Normalized distance from center (0 = center, 1 = edge)
+        du = (u - cx) / (resolution / 2)
+        dv = (v - cy) / (resolution / 2)
+        centrality = 1.0 - np.sqrt(du * du + dv * dv)
+
+        if centrality > best_score:
+            best_score = centrality
+            best_frame = cam["frame"]
+            best_u = int(round(u))
+            best_v = int(round(v))
+
+    if best_frame is None:
+        raise ValueError("3D point is not visible in any camera frame")
+
+    logger.info(
+        f"click-segment-3d: best frame={best_frame} at ({best_u}, {best_v}) "
+        f"centrality={best_score:.3f}"
+    )
+
+    frames_dir = project_dir / "frames"
+    return click_segment_project(frames_dir, project_dir, best_frame, best_u, best_v)
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +522,20 @@ async def transform_segment(
     if not segment.get("gaussian_ids"):
         raise HTTPException(status_code=400, detail="Segment has no assigned gaussians. Run assign-gaussians first.")
 
+    # Try in-memory path first (instant), fall back to PLY I/O
+    from pipeline.scene_manager import get_cached_scene, TransformOp
+    scene = get_cached_scene(project_id)
+    if scene and scene.data is not None:
+        op = TransformOp(
+            indices=segment["gaussian_ids"],
+            translation=tuple(body.translation) if body.translation else None,
+            rotation=tuple(body.rotation) if body.rotation else None,
+            scale=tuple(body.scale) if body.scale else None,
+        )
+        scene.apply_edit(op)
+        return {"status": "ok", "segment_id": segment_id, "n_gaussians_modified": len(segment["gaussian_ids"])}
+
+    # Fallback: direct PLY I/O
     _save_checkpoint(project_dir, f"transform segment {segment_id}")
 
     import asyncio
@@ -533,18 +658,25 @@ async def delete_segment(
     if not segment.get("gaussian_ids"):
         raise HTTPException(status_code=400, detail="Segment has no assigned gaussians")
 
-    _save_checkpoint(project_dir, f"delete segment {segment_id}")
+    # Try in-memory path first
+    from pipeline.scene_manager import get_cached_scene, DeleteOp
+    scene = get_cached_scene(project_id)
+    if scene and scene.data is not None:
+        scene.apply_edit(DeleteOp(indices=segment["gaussian_ids"]))
+    else:
+        # Fallback: direct PLY I/O
+        _save_checkpoint(project_dir, f"delete segment {segment_id}")
 
-    import asyncio
-    loop = asyncio.get_event_loop()
+        import asyncio
+        loop = asyncio.get_event_loop()
 
-    try:
-        await loop.run_in_executor(
-            _segment_executor,
-            lambda: _delete_gaussians(ply_path, segment["gaussian_ids"]),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            await loop.run_in_executor(
+                _segment_executor,
+                lambda: _delete_gaussians(ply_path, segment["gaussian_ids"]),
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
     # Remove segment from manifest
     manifest["segments"] = [s for s in manifest["segments"] if s["id"] != segment_id]
@@ -673,18 +805,28 @@ async def toggle_visibility(
     if not segment.get("gaussian_ids"):
         raise HTTPException(status_code=400, detail="Segment has no assigned gaussians")
 
-    _save_checkpoint(project_dir, f"{'show' if body.visible else 'hide'} segment {segment_id}")
+    # Try in-memory path: use delete/undelete for visibility
+    from pipeline.scene_manager import get_cached_scene, DeleteOp, UndeleteOp
+    scene = get_cached_scene(project_id)
+    if scene and scene.data is not None:
+        if body.visible:
+            scene.apply_edit(UndeleteOp(indices=segment["gaussian_ids"]))
+        else:
+            scene.apply_edit(DeleteOp(indices=segment["gaussian_ids"]))
+    else:
+        # Fallback: direct PLY I/O
+        _save_checkpoint(project_dir, f"{'show' if body.visible else 'hide'} segment {segment_id}")
 
-    import asyncio
-    loop = asyncio.get_event_loop()
+        import asyncio
+        loop = asyncio.get_event_loop()
 
-    try:
-        await loop.run_in_executor(
-            _segment_executor,
-            lambda: _toggle_visibility(ply_path, segment, body.visible),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            await loop.run_in_executor(
+                _segment_executor,
+                lambda: _toggle_visibility(ply_path, segment, body.visible),
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
     # Update manifest
     segment["visible"] = body.visible
@@ -986,6 +1128,20 @@ async def batch_transform(
     if not all_ids:
         raise HTTPException(status_code=400, detail="No gaussians to transform")
 
+    # Try in-memory path first
+    from pipeline.scene_manager import get_cached_scene, TransformOp
+    scene = get_cached_scene(project_id)
+    if scene and scene.data is not None:
+        op = TransformOp(
+            indices=all_ids,
+            translation=tuple(body.transform.translation) if body.transform.translation else None,
+            rotation=tuple(body.transform.rotation) if body.transform.rotation else None,
+            scale=tuple(body.transform.scale) if body.transform.scale else None,
+        )
+        scene.apply_edit(op)
+        return {"status": "ok", "n_segments": len(body.segment_ids), "n_gaussians_modified": len(all_ids)}
+
+    # Fallback: direct PLY I/O
     _save_checkpoint(project_dir, f"batch transform {len(body.segment_ids)} segments")
 
     import asyncio
@@ -1295,6 +1451,19 @@ async def adjust_lighting(
     if not segment.get("gaussian_ids"):
         raise HTTPException(status_code=400, detail="Segment has no assigned gaussians")
 
+    # Try in-memory path first
+    from pipeline.scene_manager import get_cached_scene, LightingOp
+    scene = get_cached_scene(project_id)
+    if scene and scene.data is not None:
+        scene.apply_edit(LightingOp(
+            indices=segment["gaussian_ids"],
+            brightness=body.brightness,
+            color_tint=tuple(body.color_tint),
+            sh_scale=body.sh_scale,
+        ))
+        return {"status": "ok"}
+
+    # Fallback: direct PLY I/O
     _save_checkpoint(project_dir, f"lighting segment {segment_id}")
 
     import asyncio

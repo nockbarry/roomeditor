@@ -178,17 +178,24 @@ export interface GizmoDelta {
   scale?: [number, number, number];
 }
 
+export interface SceneFormatInfo {
+  format: "spz" | "ply";
+  sizeMB: number;
+}
+
 export interface SplatSceneHandle {
   containerRef: React.RefObject<HTMLDivElement | null>;
   loading: boolean;
   error: string | null;
   numSplats: number;
+  sceneFormat: SceneFormatInfo | null;
   loadPly: (url: string) => void;
   loadScene: (sceneUrl: string, positionsUrl: string, plyFallbackUrl?: string) => void;
   splatMeshRef: React.RefObject<SplatMesh | null>;
   positionsRef: React.RefObject<Float32Array | null>;
   sceneRef: React.RefObject<THREE.Scene | null>;
   cameraRef: React.RefObject<THREE.PerspectiveCamera | null>;
+  rendererRef: React.RefObject<THREE.WebGLRenderer | null>;
   onPickRef: React.RefObject<
     ((splatIdx: number | null, point: THREE.Vector3 | null) => void) | null
   >;
@@ -230,6 +237,7 @@ export function useSplatScene(): SplatSceneHandle {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [numSplats, setNumSplats] = useState(0);
+  const [sceneFormat, setSceneFormat] = useState<SceneFormatInfo | null>(null);
 
   // Initialize Three.js + Spark once when container mounts
   useEffect(() => {
@@ -492,6 +500,7 @@ export function useSplatScene(): SplatSceneHandle {
     setLoading(true);
     setError(null);
     setNumSplats(0);
+    setSceneFormat(null);
 
     fetch(url)
       .then((res) => {
@@ -502,6 +511,7 @@ export function useSplatScene(): SplatSceneHandle {
         // If a newer load was started, discard this one
         if (loadIdRef.current !== thisLoadId) return;
 
+        setSceneFormat({ format: "ply", sizeMB: Math.round(buf.byteLength / 1048576) });
         const patched = patchPlyHeader(buf);
 
         // Extract positions for picking + compute bounds for camera
@@ -583,19 +593,24 @@ export function useSplatScene(): SplatSceneHandle {
       setLoading(true);
       setError(null);
       setNumSplats(0);
+      setSceneFormat(null);
 
       // Fetch scene file and positions sidecar in parallel
       const fetchScene = async (): Promise<{ buf: ArrayBuffer; format: string }> => {
+        console.log(`[loadScene] Trying: ${sceneUrl}`);
         const res = await fetch(sceneUrl);
         if (!res.ok) {
           if (res.status === 404 && plyFallbackUrl) {
+            console.log(`[loadScene] SPZ 404, falling back to PLY: ${plyFallbackUrl}`);
             const r = await fetch(plyFallbackUrl);
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             return { buf: await r.arrayBuffer(), format: "ply" };
           }
           throw new Error(`HTTP ${res.status}`);
         }
-        return { buf: await res.arrayBuffer(), format: "auto" };
+        const buf = await res.arrayBuffer();
+        console.log(`[loadScene] Loaded ${(buf.byteLength / 1048576).toFixed(1)}MB, magic: 0x${new DataView(buf).getUint32(0, true).toString(16)}`);
+        return { buf, format: "auto" };
       };
 
       const posPromise = fetch(positionsUrl)
@@ -608,11 +623,20 @@ export function useSplatScene(): SplatSceneHandle {
 
           const { buf, format } = sceneResult;
 
-          // Determine if this is SPZ (magic bytes "NGSP") or PLY
+          // Determine if this is SPZ or PLY.
+          // SPZ is a gzip stream (magic 0x1f 0x8b). PLY starts with ASCII "ply\n".
           const isSPZ =
             format === "auto" &&
-            buf.byteLength >= 4 &&
-            new DataView(buf).getUint32(0, true) === 0x5053474e;
+            buf.byteLength >= 2 &&
+            new Uint8Array(buf)[0] === 0x1f &&
+            new Uint8Array(buf)[1] === 0x8b;
+
+          console.log(`[loadScene] Format: ${isSPZ ? "SPZ" : "PLY"}, size: ${(buf.byteLength / 1048576).toFixed(1)}MB, positions sidecar: ${posBuf ? (posBuf.byteLength / 1048576).toFixed(1) + "MB" : "none"}`);
+
+          setSceneFormat({
+            format: isSPZ ? "spz" : "ply",
+            sizeMB: Math.round(buf.byteLength / 1048576),
+          });
 
           // For PLY, apply header patching; SPZ passes through directly
           const fileBytes = isSPZ ? buf : patchPlyHeader(buf);
@@ -801,12 +825,14 @@ export function useSplatScene(): SplatSceneHandle {
     loading,
     error,
     numSplats,
+    sceneFormat,
     loadPly,
     loadScene,
     splatMeshRef,
     positionsRef,
     sceneRef,
     cameraRef,
+    rendererRef,
     onPickRef,
     onHoverRef,
     onGizmoDragEndRef,

@@ -25,10 +25,22 @@ ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".bmp"}
 ALLOWED_EXTS = ALLOWED_VIDEO_EXTS | ALLOWED_IMAGE_EXTS
 
 
+def _enrich_project(project: Project) -> dict:
+    """Add file size info computed from the filesystem."""
+    data = ProjectResponse.model_validate(project).model_dump()
+    project_dir = settings.data_dir / "projects" / project.id
+    ply_path = project_dir / "scene.ply"
+    spz_path = project_dir / "scene.spz"
+    data["ply_size_bytes"] = ply_path.stat().st_size if ply_path.exists() else None
+    data["spz_size_bytes"] = spz_path.stat().st_size if spz_path.exists() else None
+    return data
+
+
 @router.get("", response_model=list[ProjectResponse])
 async def list_projects(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Project).order_by(Project.created_at.desc()))
-    return result.scalars().all()
+    projects = result.scalars().all()
+    return [_enrich_project(p) for p in projects]
 
 
 @router.post("", response_model=ProjectResponse, status_code=201)
@@ -51,7 +63,7 @@ async def get_project(project_id: str, db: AsyncSession = Depends(get_db)):
     project = result.scalar_one_or_none()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    return project
+    return _enrich_project(project)
 
 
 @router.delete("/{project_id}", status_code=204)

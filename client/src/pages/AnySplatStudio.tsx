@@ -69,8 +69,9 @@ export function AnySplatStudio({ projectId }: AnySplatStudioProps) {
         plyUrl: `/data/${projectId}/scene.ply`,
         plyVersion: 1,
       });
-      // Fetch quality stats for existing splat
+      // Fetch quality stats + model info for existing splat
       useAnySplatStore.getState().fetchQualityStats(projectId);
+      useAnySplatStore.getState().fetchModelInfo(projectId);
     }
 
     return () => {

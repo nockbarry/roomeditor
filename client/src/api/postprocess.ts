@@ -97,3 +97,31 @@ export async function stopRefinement(projectId: string): Promise<void> {
 export async function getRefinePresets(): Promise<Record<string, RefinePresetInfo>> {
   return api.get(`/projects/config/refine-presets`);
 }
+
+// --- Model Info ---
+
+export interface ModelFileInfo {
+  filename: string;
+  url: string;
+  size_bytes: number;
+  size_mb: number;
+  gaussian_count?: number;
+}
+
+export interface ModelStage {
+  id: string;
+  label: string;
+  description: string;
+  exists: boolean;
+  files: { ply?: ModelFileInfo; spz?: ModelFileInfo };
+}
+
+export interface ModelInfo {
+  stages: ModelStage[];
+  current_stage: string | null;
+  formats: { ply?: ModelFileInfo; spz?: ModelFileInfo };
+}
+
+export async function getModelInfo(projectId: string): Promise<ModelInfo> {
+  return api.get<ModelInfo>(`/projects/${projectId}/model-info`);
+}

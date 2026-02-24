@@ -20,10 +20,55 @@ export function useKeyboardShortcuts({
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
+      const ctrl = e.ctrlKey || e.metaKey;
+
       // Tab — toggle Build/Edit mode
       if (e.key === "Tab") {
         e.preventDefault();
         onToggleMode();
+        return;
+      }
+
+      // Ctrl+Z — undo (works in both modes)
+      if (ctrl && e.key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        const editorStore = useEditorStore.getState();
+        if (editorStore.sceneLoaded && editorStore.undoCount > 0) {
+          // Use in-memory undo
+          editorStore.undo(projectId).then(() => {
+            useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
+          });
+        } else {
+          // Fallback to file-based undo
+          const segStore = useSegmentStore.getState();
+          if (segStore.undoCount > 0) {
+            segStore.undo(projectId).then(() => {
+              useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
+            });
+          }
+        }
+        return;
+      }
+
+      // Ctrl+Shift+Z — redo
+      if (ctrl && e.key === "z" && e.shiftKey) {
+        e.preventDefault();
+        const editorStore = useEditorStore.getState();
+        if (editorStore.sceneLoaded && editorStore.redoCount > 0) {
+          editorStore.redo(projectId).then(() => {
+            useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
+          });
+        }
+        return;
+      }
+
+      // Ctrl+S — save scene
+      if (ctrl && e.key === "s") {
+        e.preventDefault();
+        const editorStore = useEditorStore.getState();
+        if (editorStore.sceneLoaded && editorStore.isDirty) {
+          editorStore.saveScene(projectId);
+        }
         return;
       }
 
@@ -32,64 +77,78 @@ export function useKeyboardShortcuts({
 
       const setToolMode = useEditorStore.getState().setToolMode;
 
-      // Tool mode shortcuts
-      if (e.key === "q" || e.key === "Q") {
-        e.preventDefault();
-        setToolMode("select");
-        return;
-      }
-      if (e.key === "g" || e.key === "G") {
-        e.preventDefault();
-        setToolMode("translate");
-        return;
-      }
-      if (e.key === "r" || e.key === "R") {
-        if (e.ctrlKey || e.metaKey) return; // Don't capture browser refresh
-        e.preventDefault();
-        setToolMode("rotate");
-        return;
-      }
-      if (e.key === "s" || e.key === "S") {
-        if (e.ctrlKey || e.metaKey) return; // Don't capture browser save
-        e.preventDefault();
-        setToolMode("scale");
-        return;
-      }
+      // Tool mode shortcuts (single keys, no modifiers)
+      if (!ctrl && !e.altKey) {
+        const lower = e.key.toLowerCase();
 
-      // Ctrl+Z — undo
-      if ((e.ctrlKey || e.metaKey) && e.key === "z") {
-        e.preventDefault();
-        const segStore = useSegmentStore.getState();
-        if (segStore.undoCount > 0) {
-          segStore.undo(projectId).then(() => {
-            useAnySplatStore.setState((s) => ({
-              plyVersion: s.plyVersion + 1,
-            }));
-          });
+        if (lower === "q") { e.preventDefault(); setToolMode("select"); return; }
+        if (lower === "g") { e.preventDefault(); setToolMode("translate"); return; }
+        if (lower === "r") { e.preventDefault(); setToolMode("rotate"); return; }
+        if (lower === "s") { e.preventDefault(); setToolMode("scale"); return; }
+        if (lower === "b") { e.preventDefault(); setToolMode("brush"); return; }
+        if (lower === "e") { e.preventDefault(); setToolMode("eraser"); return; }
+
+        // [ / ] — brush size
+        if (e.key === "[") {
+          e.preventDefault();
+          const { brushRadius } = useEditorStore.getState();
+          useEditorStore.getState().setBrushRadius(brushRadius * 0.8);
+          return;
         }
-        return;
+        if (e.key === "]") {
+          e.preventDefault();
+          const { brushRadius } = useEditorStore.getState();
+          useEditorStore.getState().setBrushRadius(brushRadius * 1.25);
+          return;
+        }
+
+        // X / Shift+X — crop mode toggle
+        if (lower === "x") {
+          const toolMode = useEditorStore.getState().toolMode;
+          if (toolMode === "crop-box" || toolMode === "crop-sphere") {
+            e.preventDefault();
+            useEditorStore.setState({
+              cropMode: e.shiftKey ? "delete-outside" : "delete-inside",
+            });
+            return;
+          }
+        }
       }
 
-      // Delete/Backspace — delete selected segments
+      // Delete/Backspace — delete brush selection or selected segments
       if (e.key === "Delete" || e.key === "Backspace") {
         e.preventDefault();
-        const segStore = useSegmentStore.getState();
-        const ids = segStore.selectedSegmentIds;
-        if (ids.length > 0) {
-          // Delete the first selected segment
-          segStore.deleteSegment(projectId, ids[0]).then(() => {
-            useAnySplatStore.setState((s) => ({
-              plyVersion: s.plyVersion + 1,
-            }));
+        const editorStore = useEditorStore.getState();
+        if (editorStore.brushSelection.size > 0) {
+          // Delete brush selection via in-memory editing
+          const indices = Array.from(editorStore.brushSelection);
+          editorStore.clearBrushSelection();
+          editorStore.applyEdit(projectId, { type: "delete", indices }).then(() => {
+            useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
           });
+        } else {
+          // Delete selected segment
+          const segStore = useSegmentStore.getState();
+          const ids = segStore.selectedSegmentIds;
+          if (ids.length > 0) {
+            segStore.deleteSegment(projectId, ids[0]).then(() => {
+              useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 }));
+            });
+          }
         }
         return;
       }
 
-      // Escape — deselect all
+      // Escape — deselect / cancel
       if (e.key === "Escape") {
         e.preventDefault();
-        useSegmentStore.getState().selectSegment(null);
+        const editorStore = useEditorStore.getState();
+        if (editorStore.brushSelection.size > 0) {
+          editorStore.clearBrushSelection();
+        } else {
+          useSegmentStore.getState().selectSegment(null);
+          setToolMode("select");
+        }
         return;
       }
     }

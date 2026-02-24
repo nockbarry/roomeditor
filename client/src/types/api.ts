@@ -6,6 +6,8 @@ export interface Project {
   gaussian_count: number | null;
   reconstruction_mode: "anysplat" | "spfsplat" | "training" | null;
   error_message: string | null;
+  ply_size_bytes: number | null;
+  spz_size_bytes: number | null;
   created_at: string;
   updated_at: string;
 }

@@ -22,6 +22,13 @@ import {
   Package,
   GitCompareArrows,
   Combine,
+  Paintbrush,
+  Eraser,
+  BoxSelect,
+  Circle,
+  Undo2,
+  Redo2,
+  Save,
 } from "lucide-react";
 import type { ToolMode } from "../../types/scene.ts";
 
@@ -36,11 +43,22 @@ const REFINE_PRESETS = [
   { id: "aggressive", label: "Aggressive", description: "Full retrain with higher LRs.", iters: 5000 },
 ] as const;
 const MESH_FORMATS = ["glb", "obj", "ply"] as const;
-const TOOL_BUTTONS: { mode: ToolMode; icon: typeof MousePointer2; label: string; shortcut: string }[] = [
+
+const TRANSFORM_TOOLS: { mode: ToolMode; icon: typeof MousePointer2; label: string; shortcut: string }[] = [
   { mode: "select", icon: MousePointer2, label: "Select", shortcut: "Q" },
   { mode: "translate", icon: Move, label: "Translate", shortcut: "G" },
   { mode: "rotate", icon: RotateCcw, label: "Rotate", shortcut: "R" },
   { mode: "scale", icon: Maximize2, label: "Scale", shortcut: "S" },
+];
+
+const PAINT_TOOLS: { mode: ToolMode; icon: typeof Paintbrush; label: string; shortcut: string }[] = [
+  { mode: "brush", icon: Paintbrush, label: "Brush Select", shortcut: "B" },
+  { mode: "eraser", icon: Eraser, label: "Eraser", shortcut: "E" },
+];
+
+const CROP_TOOLS: { mode: ToolMode; icon: typeof BoxSelect; label: string; shortcut: string }[] = [
+  { mode: "crop-box", icon: BoxSelect, label: "Crop Box", shortcut: "" },
+  { mode: "crop-sphere", icon: Circle, label: "Crop Sphere", shortcut: "" },
 ];
 
 const TAB_DEFS: TabDef[] = [
@@ -60,6 +78,18 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
   const fetchComparisonInfo = useAnySplatStore((s) => s.fetchComparisonInfo);
   const toolMode = useEditorStore((s) => s.toolMode);
   const setToolMode = useEditorStore((s) => s.setToolMode);
+  const undoCount = useEditorStore((s) => s.undoCount);
+  const redoCount = useEditorStore((s) => s.redoCount);
+  const isDirty = useEditorStore((s) => s.isDirty);
+  const isSaving = useEditorStore((s) => s.isSaving);
+  const sceneLoaded = useEditorStore((s) => s.sceneLoaded);
+  const undoAction = useEditorStore((s) => s.undo);
+  const redoAction = useEditorStore((s) => s.redo);
+  const saveScene = useEditorStore((s) => s.saveScene);
+  const brushRadius = useEditorStore((s) => s.brushRadius);
+  const setBrushRadius = useEditorStore((s) => s.setBrushRadius);
+  const cropMode = useEditorStore((s) => s.cropMode);
+  const setCropMode = useEditorStore((s) => s.setCropMode);
 
   const refinePreset = useAnySplatStore((s) => s.refinePreset);
   const setRefinePreset = useAnySplatStore((s) => s.setRefinePreset);
@@ -170,12 +200,13 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
       <RefinementProgress projectId={projectId} />
 
       {/* Tool mode toolbar */}
-      <div className="px-3 py-1.5 border-b border-gray-800 flex items-center gap-1">
-        {TOOL_BUTTONS.map(({ mode, icon: Icon, label, shortcut }) => (
+      <div className="px-3 py-1.5 border-b border-gray-800 flex items-center gap-0.5">
+        {/* Transform tools */}
+        {TRANSFORM_TOOLS.map(({ mode, icon: Icon, label, shortcut }) => (
           <button
             key={mode}
             onClick={() => setToolMode(mode)}
-            title={`${label} (${shortcut})`}
+            title={`${label}${shortcut ? ` (${shortcut})` : ""}`}
             className={`p-1.5 rounded transition-colors ${
               toolMode === mode
                 ? "bg-violet-600/30 text-violet-300"
@@ -185,7 +216,120 @@ export function EditPanel({ projectId, onSwitchToBuild }: EditPanelProps) {
             <Icon className="w-3.5 h-3.5" />
           </button>
         ))}
+
+        <div className="w-px h-4 bg-gray-800 mx-1" />
+
+        {/* Paint tools */}
+        {PAINT_TOOLS.map(({ mode, icon: Icon, label, shortcut }) => (
+          <button
+            key={mode}
+            onClick={() => setToolMode(mode)}
+            title={`${label}${shortcut ? ` (${shortcut})` : ""}`}
+            className={`p-1.5 rounded transition-colors ${
+              toolMode === mode
+                ? "bg-orange-600/30 text-orange-300"
+                : "text-gray-500 hover:text-white hover:bg-gray-800"
+            }`}
+          >
+            <Icon className="w-3.5 h-3.5" />
+          </button>
+        ))}
+
+        <div className="w-px h-4 bg-gray-800 mx-1" />
+
+        {/* Crop tools */}
+        {CROP_TOOLS.map(({ mode, icon: Icon, label }) => (
+          <button
+            key={mode}
+            onClick={() => setToolMode(mode)}
+            title={label}
+            className={`p-1.5 rounded transition-colors ${
+              toolMode === mode
+                ? "bg-red-600/30 text-red-300"
+                : "text-gray-500 hover:text-white hover:bg-gray-800"
+            }`}
+          >
+            <Icon className="w-3.5 h-3.5" />
+          </button>
+        ))}
+
+        <div className="flex-1" />
+
+        {/* Undo/Redo/Save */}
+        {sceneLoaded && (
+          <>
+            <button
+              onClick={() => undoAction(projectId).then(() => useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 })))}
+              disabled={undoCount === 0}
+              title={`Undo (Ctrl+Z) — ${undoCount}`}
+              className="p-1.5 rounded transition-colors text-gray-500 hover:text-white hover:bg-gray-800 disabled:opacity-30 disabled:cursor-default"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => redoAction(projectId).then(() => useAnySplatStore.setState((s) => ({ plyVersion: s.plyVersion + 1 })))}
+              disabled={redoCount === 0}
+              title={`Redo (Ctrl+Shift+Z) — ${redoCount}`}
+              className="p-1.5 rounded transition-colors text-gray-500 hover:text-white hover:bg-gray-800 disabled:opacity-30 disabled:cursor-default"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => saveScene(projectId)}
+              disabled={!isDirty || isSaving}
+              title="Save (Ctrl+S)"
+              className={`p-1.5 rounded transition-colors ${
+                isDirty
+                  ? "text-amber-400 hover:text-amber-300 hover:bg-amber-900/30"
+                  : "text-gray-600 cursor-default"
+              }`}
+            >
+              {isSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            </button>
+          </>
+        )}
       </div>
+
+      {/* Tool-specific options */}
+      {(toolMode === "brush" || toolMode === "eraser") && (
+        <div className="px-3 py-1.5 border-b border-gray-800 flex items-center gap-2">
+          <span className="text-[10px] text-gray-500">Radius</span>
+          <input
+            type="range"
+            min={0.01}
+            max={1.0}
+            step={0.01}
+            value={brushRadius}
+            onChange={(e) => setBrushRadius(parseFloat(e.target.value))}
+            className="flex-1 h-1 accent-orange-500"
+          />
+          <span className="text-[10px] text-gray-400 w-8 text-right">{brushRadius.toFixed(2)}</span>
+        </div>
+      )}
+      {(toolMode === "crop-box" || toolMode === "crop-sphere") && (
+        <div className="px-3 py-1.5 border-b border-gray-800 flex items-center gap-2">
+          <button
+            onClick={() => setCropMode("delete-inside")}
+            className={`flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+              cropMode === "delete-inside"
+                ? "bg-red-600/30 text-red-300 border border-red-600/40"
+                : "bg-gray-900 text-gray-500 border border-gray-800"
+            }`}
+          >
+            Delete Inside
+          </button>
+          <button
+            onClick={() => setCropMode("delete-outside")}
+            className={`flex-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+              cropMode === "delete-outside"
+                ? "bg-blue-600/30 text-blue-300 border border-blue-600/40"
+                : "bg-gray-900 text-gray-500 border border-gray-800"
+            }`}
+          >
+            Delete Outside
+          </button>
+        </div>
+      )}
 
       {/* Tabs */}
       <Tabs tabs={TAB_DEFS} activeTab={activeTab} onTabChange={setActiveTab} />

@@ -94,6 +94,203 @@ REFINE_PRESETS = {
 router = APIRouter(prefix="/api/projects", tags=["postprocess"])
 
 
+# --- Model Info ---
+
+
+def _ply_gaussian_count(path: Path) -> int | None:
+    """Read gaussian count from a PLY header without loading the whole file."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(4096).decode("ascii", errors="ignore")
+        import re
+        m = re.search(r"element vertex (\d+)", header)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def _file_info(project_id: str, project_dir: Path, filename: str) -> dict | None:
+    """Return file info dict if the file exists, else None."""
+    path = project_dir / filename
+    if not path.exists():
+        return None
+    size_bytes = path.stat().st_size
+    info: dict = {
+        "filename": filename,
+        "url": f"/data/{project_id}/{filename}",
+        "size_bytes": size_bytes,
+        "size_mb": round(size_bytes / 1048576),
+    }
+    if filename.endswith(".ply"):
+        gc = _ply_gaussian_count(path)
+        if gc is not None:
+            info["gaussian_count"] = gc
+    return info
+
+
+@router.get("/{project_id}/model-info")
+async def get_model_info(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return pipeline stage provenance and available formats for a project."""
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = settings.data_dir / "projects" / project_id
+
+    has_anysplat = (project_dir / "anysplat_output.ply").exists()
+    has_scene = (project_dir / "scene.ply").exists()
+    has_pre_prune = (project_dir / "scene_pre_prune.ply").exists()
+    has_pre_refine = (project_dir / "scene_pre_refine.ply").exists()
+
+    stages = []
+
+    # Stage 1: AnySplat — raw output before any postprocessing
+    if has_anysplat:
+        files = {}
+        info = _file_info(project_id, project_dir, "anysplat_output.ply")
+        if info:
+            files["ply"] = info
+        stages.append({
+            "id": "anysplat",
+            "label": "AnySplat",
+            "description": "Feed-forward reconstruction from video frames",
+            "exists": True,
+            "files": files,
+        })
+    else:
+        stages.append({
+            "id": "anysplat",
+            "label": "AnySplat",
+            "description": "Feed-forward reconstruction from video frames",
+            "exists": False,
+            "files": {},
+        })
+
+    # Stage 2: Cleanup — auto-cleanup (opacity/scale/floater removal)
+    # Cleanup output is the earliest pre-* backup or scene.ply itself
+    cleanup_exists = has_scene and not has_pre_prune and not has_pre_refine and not has_anysplat
+    # Actually, cleanup exists if scene.ply exists AND anysplat_output.ply also exists
+    # (meaning scene.ply is the result of cleanup applied to anysplat_output.ply)
+    # OR if there's a pre_prune/pre_refine backup (meaning cleanup happened before those)
+    cleanup_exists = has_scene and has_anysplat
+    if cleanup_exists:
+        # The cleanup output file is:
+        # - scene_pre_prune.ply if pruning happened after cleanup
+        # - scene_pre_refine.ply if refine happened after cleanup (but no prune)
+        # - scene.ply if nothing else happened after cleanup
+        if has_pre_prune:
+            cleanup_file = "scene_pre_prune.ply"
+        elif has_pre_refine:
+            cleanup_file = "scene_pre_refine.ply"
+        else:
+            cleanup_file = "scene.ply"
+
+        files = {}
+        info = _file_info(project_id, project_dir, cleanup_file)
+        if info:
+            files["ply"] = info
+        stages.append({
+            "id": "cleanup",
+            "label": "Cleanup",
+            "description": "Opacity, scale, and floater removal",
+            "exists": True,
+            "files": files,
+        })
+    else:
+        stages.append({
+            "id": "cleanup",
+            "label": "Cleanup",
+            "description": "Opacity, scale, and floater removal",
+            "exists": False,
+            "files": {},
+        })
+
+    # Stage 3: Prune — gaussian pruning
+    if has_pre_prune:
+        # Prune output is scene_pre_refine.ply if refine happened, else scene.ply
+        if has_pre_refine:
+            prune_file = "scene_pre_refine.ply"
+        else:
+            prune_file = "scene.ply"
+
+        files = {}
+        info = _file_info(project_id, project_dir, prune_file)
+        if info:
+            files["ply"] = info
+        stages.append({
+            "id": "prune",
+            "label": "Prune",
+            "description": "Low-opacity gaussian pruning",
+            "exists": True,
+            "files": files,
+        })
+    else:
+        stages.append({
+            "id": "prune",
+            "label": "Prune",
+            "description": "Low-opacity gaussian pruning",
+            "exists": False,
+            "files": {},
+        })
+
+    # Stage 4: Refine — training refinement
+    if has_pre_refine:
+        files = {}
+        info = _file_info(project_id, project_dir, "scene.ply")
+        if info:
+            files["ply"] = info
+        # SPZ is always generated from scene.ply
+        spz_info = _file_info(project_id, project_dir, "scene.spz")
+        if spz_info:
+            files["spz"] = spz_info
+        stages.append({
+            "id": "refine",
+            "label": "Refine",
+            "description": "Training-based refinement",
+            "exists": True,
+            "files": files,
+        })
+    else:
+        stages.append({
+            "id": "refine",
+            "label": "Refine",
+            "description": "Training-based refinement",
+            "exists": False,
+            "files": {},
+        })
+
+    # Determine current (latest) stage
+    if has_pre_refine:
+        current_stage = "refine"
+    elif has_pre_prune:
+        current_stage = "prune"
+    elif cleanup_exists:
+        current_stage = "cleanup"
+    elif has_anysplat:
+        current_stage = "anysplat"
+    else:
+        current_stage = None
+
+    # Current scene formats (scene.ply + scene.spz)
+    formats = {}
+    ply_info = _file_info(project_id, project_dir, "scene.ply")
+    if ply_info:
+        formats["ply"] = ply_info
+    spz_info = _file_info(project_id, project_dir, "scene.spz")
+    if spz_info:
+        formats["spz"] = spz_info
+
+    return {
+        "stages": stages,
+        "current_stage": current_stage,
+        "formats": formats,
+    }
+
+
 # --- Prune ---
 
 

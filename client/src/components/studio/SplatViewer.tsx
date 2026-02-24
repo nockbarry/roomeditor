@@ -6,7 +6,8 @@ import { useEditorStore } from "../../stores/editorStore.ts";
 import { useCollabStore } from "../../stores/collabStore.ts";
 import { useSplatScene } from "../../hooks/useSplatScene.ts";
 import { useSplatHighlight } from "../../hooks/useSplatHighlight.ts";
-import { Box, Loader2 } from "lucide-react";
+import { ModelProvenance } from "./ModelProvenance.tsx";
+import { Box, Loader2, Camera } from "lucide-react";
 
 interface SplatViewerProps {
   projectId: string;
@@ -20,8 +21,8 @@ function formatGaussianCount(n: number): string {
 
 export function SplatViewer({ projectId }: SplatViewerProps) {
   const {
-    containerRef, loading, error, numSplats, loadPly, loadScene,
-    splatMeshRef, positionsRef, sceneRef, cameraRef,
+    containerRef, loading, error, numSplats, sceneFormat, loadPly, loadScene,
+    splatMeshRef, positionsRef, sceneRef, cameraRef, rendererRef,
     onPickRef, onHoverRef, onGizmoDragEndRef, updateGizmo,
   } = useSplatScene();
 
@@ -29,6 +30,7 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
   const plyVersion = useAnySplatStore((s) => s.plyVersion);
   const isRunning = useAnySplatStore((s) => s.isRunning);
   const lastRun = useAnySplatStore((s) => s.lastRun);
+  const activeFormat = useAnySplatStore((s) => s.activeFormat);
   const showComparison = useAnySplatStore((s) => s.showComparison);
   const comparisonBeforeUrl = useAnySplatStore((s) => s.comparisonBeforeUrl);
   const setShowComparison = useAnySplatStore((s) => s.setShowComparison);
@@ -194,17 +196,52 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
   useEffect(() => {
     if (!plyUrl) return;
     const t = Date.now();
-    // Try SPZ first, fall back to PLY via loadScene
-    const spzUrl = plyUrl.replace(/\.ply$/, ".spz");
-    const posUrl = plyUrl.replace(/\.ply$/, ".positions.bin");
-    if (spzUrl !== plyUrl) {
-      // Normal scene.ply URL — try SPZ with PLY fallback
+    const isScenePly = plyUrl.endsWith("scene.ply");
+    const isSpzUrl = plyUrl.endsWith(".spz");
+
+    if (isSpzUrl) {
+      // Directly loading an SPZ file (e.g. from format toggle)
+      const posUrl = plyUrl.replace(/\.spz$/, ".positions.bin");
+      const plyFallback = plyUrl.replace(/\.spz$/, ".ply");
+      console.log(`[SplatViewer] Loading SPZ directly: ${plyUrl}`);
+      loadScene(`${plyUrl}?t=${t}`, `${posUrl}?t=${t}`, `${plyFallback}?t=${t}`);
+    } else if (isScenePly && activeFormat === "spz") {
+      // scene.ply URL + SPZ preferred — try SPZ with PLY fallback
+      const spzUrl = plyUrl.replace(/\.ply$/, ".spz");
+      const posUrl = plyUrl.replace(/\.ply$/, ".positions.bin");
+      console.log(`[SplatViewer] Loading via loadScene: SPZ=${spzUrl}, PLY fallback=${plyUrl}`);
       loadScene(`${spzUrl}?t=${t}`, `${posUrl}?t=${t}`, `${plyUrl}?t=${t}`);
+    } else if (plyUrl.endsWith(".ply")) {
+      // PLY format preferred or non-scene PLY (stage files, comparisons)
+      const spzUrl = plyUrl.replace(/\.ply$/, ".spz");
+      if (spzUrl !== plyUrl) {
+        // Has a potential positions sidecar — use loadScene with PLY as primary
+        const posUrl = plyUrl.replace(/\.ply$/, ".positions.bin");
+        console.log(`[SplatViewer] Loading PLY directly: ${plyUrl}`);
+        loadScene(`${plyUrl}?t=${t}`, `${posUrl}?t=${t}`);
+      } else {
+        console.log(`[SplatViewer] Loading via loadPly: ${plyUrl}`);
+        loadPly(`${plyUrl}?t=${t}`);
+      }
     } else {
-      // Non-standard PLY URL (comparison snapshots etc.) — load directly
+      console.log(`[SplatViewer] Loading via loadPly: ${plyUrl}`);
       loadPly(`${plyUrl}?t=${t}`);
     }
-  }, [plyUrl, plyVersion, loadPly, loadScene]);
+  }, [plyUrl, plyVersion, activeFormat, loadPly, loadScene]);
+
+  const takeScreenshot = useCallback(() => {
+    const renderer = rendererRef.current;
+    const scene = sceneRef.current;
+    const camera = cameraRef.current;
+    if (!renderer || !scene || !camera) return;
+    // Render one frame to ensure the canvas is up-to-date
+    renderer.render(scene, camera);
+    const dataUrl = renderer.domElement.toDataURL("image/png");
+    const link = document.createElement("a");
+    link.download = `screenshot-${Date.now()}.png`;
+    link.href = dataUrl;
+    link.click();
+  }, [rendererRef, sceneRef, cameraRef]);
 
   return (
     <div className={`flex-1 min-h-0 relative rounded-lg overflow-hidden bg-gray-900 border border-gray-800 ${hoveredSegmentId !== null ? "cursor-pointer" : ""}`}>
@@ -244,10 +281,11 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
         </div>
       )}
 
-      {lastRun && !loading && (
-        <div className="absolute bottom-2 left-2 flex items-center gap-2 z-10">
+      {!loading && (numSplats > 0 || lastRun) && (
+        <div className="absolute bottom-2 left-2 flex items-center gap-1.5 z-10">
+          <ModelProvenance projectId={projectId} sceneFormat={sceneFormat} />
           <span className="text-xs text-gray-500 bg-gray-900/80 px-2 py-1 rounded">
-            {formatGaussianCount(numSplats || lastRun.n_gaussians)} Gaussians
+            {formatGaussianCount(numSplats || lastRun?.n_gaussians || 0)} Gaussians
           </span>
         </div>
       )}
@@ -303,8 +341,19 @@ export function SplatViewer({ projectId }: SplatViewerProps) {
         </div>
       )}
 
-      <div className="absolute bottom-2 right-2 text-[10px] text-gray-600 bg-gray-900/80 px-2 py-1 rounded z-10">
-        LMB drag to orbit &middot; Scroll to zoom &middot; RMB drag to pan
+      <div className="absolute bottom-2 right-2 flex items-center gap-1.5 z-10">
+        {numSplats > 0 && (
+          <button
+            onClick={takeScreenshot}
+            className="flex items-center gap-1 text-[10px] text-gray-400 hover:text-white bg-gray-900/80 hover:bg-gray-800/90 px-2 py-1 rounded transition-colors"
+            title="Take screenshot"
+          >
+            <Camera className="w-3 h-3" />
+          </button>
+        )}
+        <span className="text-[10px] text-gray-600 bg-gray-900/80 px-2 py-1 rounded">
+          LMB drag to orbit &middot; Scroll to zoom &middot; RMB drag to pan
+        </span>
       </div>
     </div>
   );
